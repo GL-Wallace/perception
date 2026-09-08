@@ -1,0 +1,16 @@
+# 环境与数据（所有子项目通用）
+.venvs/
+.conda_pkgs/
+dataset/
+data/
+work_dirs/
+*.pkl
+*.bin
+*.tfrecord
+*.pt
+*.pth
+*.so
+build/
+__pycache__/
+*.pyc
+.vscode/

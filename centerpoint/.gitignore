@@ -1,0 +1,23 @@
+**__pycache__**
+**build**
+**egg-info**
+**dist**
+data/
+*.pyc
+venv/
+*.idea/
+*.so
+*.yaml
+*.sh 
+*.pth
+*.pkl
+*.zip
+*.bin
+.vscode/
+work_dirs/
+
+# ---- 个人环境/数据（不上传） ----
+.venvs/
+.conda_pkgs/
+dataset/
+*.tfrecord
