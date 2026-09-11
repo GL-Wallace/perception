@@ -1,3 +1,9 @@
+"""Waymo 数据集 CenterPoint 两阶段 PointPillars 配置（三类别、BEV 二阶段精炼）。
+
+第一阶段复用 waymo_centerpoint_pp_two_pfn_stride1_3x 权重并冻结（freeze=True），检测 VEHICLE/PEDESTRIAN/CYCLIST；
+第二阶段 BEVFeatureExtractor 采样 5 个面中心特征，RoIHead 预测 IoU 置信度并精炼框（论文 Sec. 3.4）。
+体素 0.32x0.32x6.0 米、单帧输入（nsweeps=1）；微调 6 epoch，Adam + OneCycle（峰值 lr=0.003）。
+"""
 import itertools
 import logging
 
@@ -9,12 +15,13 @@ tasks = [
 
 class_names = list(itertools.chain(*[t["class_names"] for t in tasks]))
 
-# training and testing settings
+# 训练与测试共用的目标分配器声明：此处仅转发任务列表，具体分配参数见下方 assigner。
 target_assigner = dict(
     tasks=tasks,
 )
 
-# model settings
+# 模型配置：两阶段检测器，first_stage_cfg 为一阶段网络（freeze=True 冻结），
+# second_stage_modules 采样特征，roi_head 做框精炼（论文 Sec. 3.4）。
 model = dict(
     type='TwoStageDetector',
     first_stage_cfg=dict(
@@ -49,6 +56,7 @@ model = dict(
             common_heads={'reg': (2, 2), 'height': (1, 2), 'dim':(3, 2), 'rot':(2, 2)}, # (output_channel, num_conv)
         ),
     ),
+    # 第二阶段特征提取：从候选框的面中心采样 BEV 特征。
     second_stage_modules=[
         dict(
             type="BEVFeatureExtractor",
@@ -57,6 +65,7 @@ model = dict(
             out_stride=1
         )
     ],
+    # 第二阶段 RoI 精炼：MLP 预测 IoU 置信度并回归框偏移（论文 Sec. 3.4）。
     roi_head=dict(
         type="RoIHead",
         input_channels=128*3*5,
@@ -95,6 +104,8 @@ model = dict(
     freeze=True
 )
 
+# 训练目标分配器：将 GT 目标中心映射到热图网格并构造回归目标（论文 Sec. 3.2）；
+# 热图与回归损失由一阶段检测头权值控制（论文 Sec. 3.3）。
 assigner = dict(
     target_assigner=target_assigner,
     out_size_factor=get_downsample_factor(model),
@@ -107,6 +118,7 @@ assigner = dict(
 
 train_cfg = dict(assigner=assigner)
 
+# 推理后处理：过滤中心点合法范围，再做旋转 NMS 去重并与置信度阈值比较。
 test_cfg = dict(
     post_center_limit_range=[-80, -80, -10.0, 80, 80, 10.0],
     max_per_img=4096,
@@ -124,7 +136,7 @@ test_cfg = dict(
 )
 
 
-# dataset settings
+# 数据集配置：Waymo 数据集，nsweeps 表示叠加的激光扫描帧数。
 dataset_type = "WaymoDataset"
 nsweeps = 1
 data_root = "data/Waymo"
@@ -194,6 +206,7 @@ train_anno = "data/Waymo/infos_train_01sweeps_filter_zero_gt.pkl"
 val_anno = "data/Waymo/infos_val_01sweeps_filter_zero_gt.pkl"
 test_anno = None
 
+# 数据加载器配置：每卡 batch 大小与数据加载线程数，以及 train/val/test 三个数据集实例。
 data = dict(
     samples_per_gpu=4,
     workers_per_gpu=4,
@@ -231,7 +244,7 @@ data = dict(
 
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
-# optimizer
+# 优化器与学习率：Adam 优化器配合 OneCycle 余弦学习率调度（lr_max 为峰值学习率）。
 optimizer = dict(
     type="adam", amsgrad=0.0, wd=0.01, fixed_wd=True, moving_average=False,
 )
@@ -249,7 +262,7 @@ log_config = dict(
     ],
 )
 # yapf:enable
-# runtime settings
+# 运行时配置：总训练轮数、GPU 数目、分布式后端与日志级别。
 total_epochs = 6
 device_ids = range(8)
 dist_params = dict(backend="nccl", init_method="env://")

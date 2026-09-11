@@ -1,3 +1,7 @@
+"""数据预处理 pipeline 子包。
+
+汇集数据加载、增强、体素化、标签分配与格式化等各 pipeline 阶段的算子定义。
+"""
 from .compose import Compose
 from .formating import Reformat
 

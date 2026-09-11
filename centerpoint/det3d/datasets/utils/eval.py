@@ -1,3 +1,10 @@
+"""3D 检测评测的 IoU 与 TP/FP/FN 统计工具（KITTI 风格）。
+
+提供 BEV/3D/图像 IoU 计算与逐帧 GT-检测匹配统计，用于 KITTI 评测：
+    - prepare_data / calculate_iou_partly: 组织数据并分块计算重叠度。
+    - compute_statistics_jit: numba 加速的 TP/FP/FN 与 AOS 统计。
+    - image_box_overlap / bev_box_overlap / box3d_overlap: 三种视角的重叠度计算。
+"""
 import numpy as np
 import numba
 
@@ -7,6 +14,15 @@ from det3d.core import box_np_ops
 
 
 def get_split_parts(num, num_part):
+    """把总数 num 尽量均匀地拆成 num_part 份。
+
+    Args:
+        num (int): 总数。
+        num_part (int): 期望份数。
+
+    Returns:
+        list: 各份大小（最后可能多出一个余数份）。
+    """
     same_part = num // num_part
     remain_num = num % num_part
     if remain_num == 0:
@@ -16,6 +32,20 @@ def get_split_parts(num, num_part):
 
 
 def prepare_data(gt_annos, dt_annos, current_class, difficulty=None, clean_data=None):
+    """逐帧调用 clean_data 整理 GT 与检测结果，并汇总为评测所需的数据结构。
+
+    Args:
+        gt_annos (list): 每帧 GT 标注。
+        dt_annos (list): 每帧检测结果。
+        current_class (int): 当前评测类别。
+        difficulty (int, optional): 难度分级。
+        clean_data (callable): 过滤/整理函数，返回
+            (num_valid_gt, ignored_gt, ignored_det, dc_bboxes)。
+
+    Returns:
+        tuple: (gt_datas_list, dt_datas_list, ignored_gts, ignored_dets,
+            dontcares, total_dc_num, total_num_valid_gt)。
+    """
     gt_datas_list = []
     dt_datas_list = []
     total_dc_num = []
@@ -33,9 +63,11 @@ def prepare_data(gt_annos, dt_annos, current_class, difficulty=None, clean_data=
         total_dc_num.append(dc_bboxes.shape[0])
         dontcares.append(dc_bboxes)
         total_num_valid_gt += num_valid_gt
+        # bbox + alpha 拼成 [N,5]（bbox 4 维 + alpha 1 维）
         gt_datas = np.concatenate(
             [gt_annos[i]["bbox"], gt_annos[i]["alpha"][..., np.newaxis]], 1
         )
+        # 检测结果 bbox + alpha + score 拼成 [N,6]
         dt_datas = np.concatenate(
             [
                 dt_annos[i]["bbox"],
@@ -61,14 +93,21 @@ def prepare_data(gt_annos, dt_annos, current_class, difficulty=None, clean_data=
 def calculate_iou_partly(
     gt_annos, dt_annos, metric, num_parts=50, z_axis=1, z_center=1.0
 ):
-    """fast iou algorithm. this function can be used independently to
-    do result analysis.
+    """分块快速计算 GT 与检测结果之间的 IoU/重叠度（可独立用于结果分析）。
+
+    为避免一次性构造超大重叠矩阵，把示例分成 num_parts 块分别计算，再按每帧的
+    框数量切回逐帧结果。
+
     Args:
-        gt_annos: dict, must from get_label_annos() in kitti_common.py
-        dt_annos: dict, must from get_label_annos() in kitti_common.py
-        metric: eval type. 0: bbox, 1: bev, 2: 3d
-        num_parts: int. a parameter for fast calculate algorithm
-        z_axis: height axis. kitti camera use 1, lidar use 2.
+        gt_annos (list): GT 标注列表（每项为 dict）。
+        dt_annos (list): 检测结果列表。
+        metric (int): 评测类型，0: 2D bbox，1: BEV，2: 3D。
+        num_parts (int): 分块数量。
+        z_axis (int): 高度轴（KITTI 相机为 1，lidar 为 2）。
+        z_center (float): 统一的高度中心。
+
+    Returns:
+        tuple: (overlaps, parted_overlaps, total_gt_num, total_dt_num)。
     """
     assert len(gt_annos) == len(dt_annos)
     total_dt_num = np.stack([len(a["name"]) for a in dt_annos], 0)
@@ -127,6 +166,7 @@ def calculate_iou_partly(
         for i in range(num_part):
             gt_box_num = total_gt_num[example_idx + i]
             dt_box_num = total_dt_num[example_idx + i]
+            # 把分块计算的结果按帧切回 [gt_num, dt_num] 子矩阵
             overlaps.append(
                 parted_overlaps[j][
                     gt_num_idx : gt_num_idx + gt_box_num,
@@ -154,6 +194,27 @@ def compute_statistics_jit(
     compute_fp=False,
     compute_aos=False,
 ):
+    """（numba 加速）在重叠度矩阵上统计 TP/FP/FN 与 AOS 相似度。
+
+    对每个 GT 按分数/重叠度贪心匹配一个检测；未匹配的 GT 计 FN，未匹配且非忽略的
+    检测计 FP，匹配成功者计 TP（同时记录其分数用于后续 PR 曲线）。
+
+    Args:
+        overlaps (list): 每帧的 [gt_num, dt_num] 重叠度矩阵。
+        gt_datas (np.ndarray): 拼接后的 GT [N,5]（bbox + alpha）。
+        dt_datas (np.ndarray): 拼接后的检测 [N,6]（bbox + alpha + score）。
+        ignored_gt (list): 每帧 GT 的忽略标记。
+        ignored_det (list): 每帧检测的忽略标记。
+        dc_bboxes: 每帧 don't care 框。
+        metric (int): 评测类型。
+        min_overlap (float): 匹配的最小重叠阈值。
+        thresh (float): 分数阈值（compute_fp 时低于该值的检测忽略）。
+        compute_fp (bool): 是否统计 FP。
+        compute_aos (bool): 是否计算 AOS（方向相似度）。
+
+    Returns:
+        tuple: (tp, fp, fn, similarity, thresholds)。
+    """
 
     det_size = dt_datas.shape[0]
     gt_size = gt_datas.shape[0]
@@ -228,7 +289,7 @@ def compute_statistics_jit(
         ):
             assigned_detection[det_idx] = True
         elif valid_detection != NO_DETECTION:
-            # only a tp add a threshold.
+            # 只有真正的 TP 才记录分数与朝向差
             tp += 1
             # thresholds.append(dt_scores[det_idx])
             thresholds[thresh_idx] = dt_scores[det_idx]
@@ -241,6 +302,7 @@ def compute_statistics_jit(
             assigned_detection[det_idx] = True
     if compute_fp:
         for i in range(det_size):
+            # 未被匹配、非忽略、且分数达标的检测记为 FP
             if not (
                 assigned_detection[i]
                 or ignored_det[i] == -1
@@ -280,6 +342,16 @@ def compute_statistics_jit(
 
 @numba.jit(nopython=True)
 def image_box_overlap(boxes, query_boxes, criterion=-1):
+    """计算 2D 轴对齐框之间的 IoU（或按 criterion 指定的分母）。
+
+    Args:
+        boxes (np.ndarray): [N,4] 轴对齐框 (x1,y1,x2,y2)。
+        query_boxes (np.ndarray): [K,4] 查询框。
+        criterion (int): -1 为并集 IoU，0 用 boxes 面积，1 用 query 面积作分母。
+
+    Returns:
+        np.ndarray: [N,K] 重叠度矩阵。
+    """
     N = boxes.shape[0]
     K = query_boxes.shape[0]
     overlaps = np.zeros((N, K), dtype=boxes.dtype)
@@ -313,6 +385,17 @@ def image_box_overlap(boxes, query_boxes, criterion=-1):
 
 
 def bev_box_overlap(boxes, qboxes, criterion=-1, stable=False):
+    """计算 BEV（鸟瞰图）旋转框之间的 IoU。
+
+    Args:
+        boxes (np.ndarray): [N,7] BEV 框。
+        qboxes (np.ndarray): [K,7] 查询框。
+        criterion (int): -1 为 IoU，0 用 boxes 面积，1 用 qboxes 面积。
+        stable (bool): 是否使用 CPU 稳定版 riou_cc。
+
+    Returns:
+        np.ndarray: [N,K] 重叠度矩阵。
+    """
     if stable:
         riou = box_np_ops.riou_cc(boxes, qboxes)
     else:
@@ -323,8 +406,10 @@ def bev_box_overlap(boxes, qboxes, criterion=-1, stable=False):
 @numba.jit(nopython=True, parallel=True)
 def box3d_overlap_kernel(boxes, qboxes, rinc, criterion=-1, z_axis=1, z_center=1.0):
     """
-        z_axis: the z (height) axis.
-        z_center: unified z (height) center of box.
+    在 BEV 旋转 IoU（rinc）基础上叠加高度重叠，得到 3D IoU。
+
+    z_axis: 高度轴索引。
+    z_center: 统一的框高度中心（0~1）。
     """
     N, K = boxes.shape[0], qboxes.shape[0]
     for i in range(N):
@@ -357,7 +442,19 @@ def box3d_overlap_kernel(boxes, qboxes, rinc, criterion=-1, z_axis=1, z_center=1
 
 
 def box3d_overlap(boxes, qboxes, criterion=-1, z_axis=1, z_center=1.0):
-    """kitti camera format z_axis=1.
+    """计算 3D 框之间的 IoU。
+
+    先取出去除高度与 z 后的 BEV 7 维子集计算旋转 IoU，再叠加高度重叠。
+
+    Args:
+        boxes (np.ndarray): [N,7] 3D 框（x,y,z,dx,dy,dz,yaw）。
+        qboxes (np.ndarray): [K,7] 查询框。
+        criterion (int): -1 为 IoU，0 用 boxes 体积，1 用 qboxes 体积。
+        z_axis (int): 高度轴索引。
+        z_center (float): 统一的框高度中心。
+
+    Returns:
+        np.ndarray: [N,K] 3D IoU 矩阵。
     """
     bev_axes = list(range(7))
     bev_axes.pop(z_axis + 3)

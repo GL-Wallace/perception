@@ -1,3 +1,15 @@
+"""通用杂项工具。
+
+提供类型判断、迭代器/列表转换、序列切片/拼接以及前置依赖检查等小型通用函数，
+被 fileio、config、progressbar 等其他 torchie 模块广泛复用。
+
+主要函数：
+    - is_str / is_seq_of / is_list_of / is_tuple_of: 类型判断。
+    - iter_cast / list_cast / tuple_cast: 迭代器元素类型转换。
+    - slice_list / concat_list: 列表切片与拼接。
+    - check_prerequisites / requires_package / requires_executable: 依赖检查装饰器。
+"""
+
 import collections
 import functools
 import itertools
@@ -6,8 +18,8 @@ from importlib import import_module
 
 import six
 
-# ABCs from collections will be deprecated in python 3.8+,
-# while collections.abc is not available in python 2.7
+# collections 的 ABC 在 python 3.8+ 将被弃用，而 collections.abc 在 python 2.7
+# 中不可用，这里做兼容性导入。
 try:
     import collections.abc as collections_abc
 except ImportError:
@@ -15,21 +27,20 @@ except ImportError:
 
 
 def is_str(x):
-    """Whether the input is an string instance."""
+    """判断输入是否为字符串实例。"""
     return isinstance(x, six.string_types)
 
 
 def iter_cast(inputs, dst_type, return_type=None):
-    """Cast elements of an iterable object into some type.
+    """将可迭代对象的元素转换为指定类型。
 
     Args:
-        inputs (Iterable): The input object.
-        dst_type (type): Destination type.
-        return_type (type, optional): If specified, the output object will be
-            converted to this type, otherwise an iterator.
+        inputs (Iterable): 输入对象。
+        dst_type (type): 目标类型。
+        return_type (type, optional): 若指定，则输出会被转换为该类型，否则返回迭代器。
 
     Returns:
-        iterator or specified type: The converted object.
+        iterator 或指定类型: 转换后的对象。
     """
     if not isinstance(inputs, collections_abc.Iterable):
         raise TypeError("inputs must be an iterable object")
@@ -45,31 +56,31 @@ def iter_cast(inputs, dst_type, return_type=None):
 
 
 def list_cast(inputs, dst_type):
-    """Cast elements of an iterable object into a list of some type.
+    """将可迭代对象的元素转换成一个指定类型元素的列表。
 
-    A partial method of :func:`iter_cast`.
+    是 :func:`iter_cast` 的便捷版本。
     """
     return iter_cast(inputs, dst_type, return_type=list)
 
 
 def tuple_cast(inputs, dst_type):
-    """Cast elements of an iterable object into a tuple of some type.
+    """将可迭代对象的元素转换成一个指定类型元素的元组。
 
-    A partial method of :func:`iter_cast`.
+    是 :func:`iter_cast` 的便捷版本。
     """
     return iter_cast(inputs, dst_type, return_type=tuple)
 
 
 def is_seq_of(seq, expected_type, seq_type=None):
-    """Check whether it is a sequence of some type.
+    """判断是否为某类型的序列。
 
     Args:
-        seq (Sequence): The sequence to be checked.
-        expected_type (type): Expected type of sequence items.
-        seq_type (type, optional): Expected sequence type.
+        seq (Sequence): 待检查的序列。
+        expected_type (type): 期望的元素类型。
+        seq_type (type, optional): 期望的序列类型。
 
     Returns:
-        bool: Whether the sequence is valid.
+        bool: 序列是否合法。
     """
     if seq_type is None:
         exp_seq_type = collections_abc.Sequence
@@ -85,30 +96,30 @@ def is_seq_of(seq, expected_type, seq_type=None):
 
 
 def is_list_of(seq, expected_type):
-    """Check whether it is a list of some type.
+    """判断是否为某类型的列表。
 
-    A partial method of :func:`is_seq_of`.
+    是 :func:`is_seq_of` 的便捷版本。
     """
     return is_seq_of(seq, expected_type, seq_type=list)
 
 
 def is_tuple_of(seq, expected_type):
-    """Check whether it is a tuple of some type.
+    """判断是否为某类型的元组。
 
-    A partial method of :func:`is_seq_of`.
+    是 :func:`is_seq_of` 的便捷版本。
     """
     return is_seq_of(seq, expected_type, seq_type=tuple)
 
 
 def slice_list(in_list, lens):
-    """Slice a list into several sub lists by a list of given length.
+    """按给定的长度列表把一个列表切成若干子列表。
 
     Args:
-        in_list (list): The list to be sliced.
-        lens(int or list): The expected length of each out list.
+        in_list (list): 待切分的列表。
+        lens(int or list): 每个输出子列表的期望长度。
 
     Returns:
-        list: A list of sliced list.
+        list: 若干子列表组成的列表。
     """
     if not isinstance(lens, list):
         raise TypeError('"indices" must be a list of integers')
@@ -127,13 +138,13 @@ def slice_list(in_list, lens):
 
 
 def concat_list(in_list):
-    """Concatenate a list of list into a single list.
+    """把嵌套的列表拼成一个扁平列表。
 
     Args:
-        in_list (list): The list of list to be merged.
+        in_list (list): 待合并的列表的列表。
 
     Returns:
-        list: The concatenated flat list.
+        list: 拼接后的扁平列表。
     """
     return list(itertools.chain(*in_list))
 
@@ -144,16 +155,15 @@ def check_prerequisites(
     msg_tmpl='Prerequisites "{}" are required in method "{}" but not '
     "found, please install them first.",
 ):
-    """A decorator factory to check if prerequisites are satisfied.
+    """装饰器工厂：检查前置依赖是否满足。
 
     Args:
-        prerequisites (str of list[str]): Prerequisites to be checked.
-        checker (callable): The checker method that returns True if a
-            prerequisite is meet, False otherwise.
-        msg_tmpl (str): The message template with two variables.
+        prerequisites (str or list[str]): 需要检查的前置依赖。
+        checker (callable): 检查函数，满足时返回 True，否则返回 False。
+        msg_tmpl (str): 含两个占位符的消息模板。
 
     Returns:
-        decorator: A specific decorator.
+        decorator: 具体的装饰器。
     """
 
     def wrap(func):
@@ -178,6 +188,7 @@ def check_prerequisites(
 
 
 def _check_py_package(package):
+    """通过尝试导入判断 Python 包是否已安装。"""
     try:
         import_module(package)
     except ImportError:
@@ -187,6 +198,7 @@ def _check_py_package(package):
 
 
 def _check_executable(cmd):
+    """通过 shell 的 which 命令判断可执行文件是否存在。"""
     if subprocess.call("which {}".format(cmd), shell=True) != 0:
         return False
     else:
@@ -194,7 +206,7 @@ def _check_executable(cmd):
 
 
 def requires_package(prerequisites):
-    """A decorator to check if some python packages are installed.
+    """装饰器：检查某些 Python 包是否已安装。
 
     Example:
         >>> @requires_package('numpy')
@@ -210,7 +222,7 @@ def requires_package(prerequisites):
 
 
 def requires_executable(prerequisites):
-    """A decorator to check if some executable files are installed.
+    """装饰器：检查某些可执行文件是否已安装。
 
     Example:
         >>> @requires_executable('ffmpeg')

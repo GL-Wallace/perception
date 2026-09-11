@@ -1,7 +1,11 @@
-"""Waymo open dataset decoder.
-    Taken from https://github.com/WangYueFt/pillar-od
-    # Copyright (c) Massachusetts Institute of Technology and its affiliates.
-    # Licensed under MIT License
+"""Waymo Open Dataset 原始 Frame protobuf 的解码器。
+
+负责把 tfrecord 中的 Frame 解析为点云与标注等 numpy 数据：
+    - decode_frame: 解码点云（xyz + intensity/elongation 等特征）。
+    - decode_annos: 解码位姿与 3D box 标注（含速度由全局系转到参考系）。
+
+点云解码的核心是 extract_points_from_range_image：将 range image 通过外参与
+像素位姿重建为笛卡尔点云。改编自 https://github.com/WangYueFt/pillar-od (MIT License)。
 """
 
 from __future__ import absolute_import
@@ -20,12 +24,22 @@ from waymo_open_dataset.utils import transform_utils
 tf.enable_v2_behavior()
 
 def decode_frame(frame, frame_id):
-  """Decodes native waymo Frame proto to tf.Examples."""
+  """将 Waymo Frame protobuf 解码为点云字典。
+
+  Args:
+    frame: dataset_pb2.Frame 对象。
+    frame_id (int): 帧序号（仅作为元信息保存）。
+
+  Returns:
+    dict: 含 scene_name、frame_name、frame_id 与 lidars（points_xyz、
+        points_feature）的点云数据。
+  """
 
   lidars = extract_points(frame.lasers,
                           frame.context.laser_calibrations,
                           frame.pose)
 
+  # 帧名用于对齐标注 pickle（scene_name_location_timeofday_timestamp）
   frame_name = '{scene_name}_{location}_{time_of_day}_{timestamp}'.format(
       scene_name=frame.context.name,
       location=frame.context.stats.location,
@@ -43,7 +57,16 @@ def decode_frame(frame, frame_id):
   # return encode_tf_example(example_data, FEATURE_SPEC)
 
 def decode_annos(frame, frame_id):
-  """Decodes some meta data (e.g. calibration matrices, frame matrices)."""
+  """将 Waymo Frame protobuf 解码为位姿与 3D box 标注。
+
+  Args:
+    frame: dataset_pb2.Frame 对象。
+    frame_id (int): 帧序号。
+
+  Returns:
+    dict: 含 scene_name、frame_name、frame_id、veh_to_global 位姿与
+        objects（box/速度/难度等）的标注数据。
+  """
 
   veh_to_global = np.array(frame.pose.transform)
 
@@ -69,7 +92,19 @@ def decode_annos(frame, frame_id):
 
 
 def extract_points_from_range_image(laser, calibration, frame_pose):
-  """Decode points from lidar."""
+  """从单帧 range image 重建 lidar 点云。
+
+  对第一、第二回波分别解压 range image，结合外参、波束倾角与像素位姿，
+  反投影得到笛卡尔坐标，并与强度/伸长率特征拼接后返回。
+
+  Args:
+    laser: dataset_pb2.Laser 对象（含压缩的 range image）。
+    calibration: 对应激光的标定信息。
+    frame_pose: 帧位姿。
+
+  Returns:
+    list: 每项为 [N, 6] 点云（xyz + intensity + elongation + 是否 second return）。
+  """
   if laser.name != calibration.name:
     raise ValueError('Laser and calibration do not match')
   if laser.name == dataset_pb2.LaserName.TOP:
@@ -124,6 +159,7 @@ def extract_points_from_range_image(laser, calibration, frame_pose):
             pixel_pose=pixel_pose,
             frame_pose=frame_pose))
     range_image_cartesian = tf.squeeze(range_image_cartesian, axis=0)
+    # 拼接笛卡尔坐标与 range image 的第 2~4 通道（intensity、elongation、second-return 标记）
     points_tensor = tf.gather_nd(
         tf.concat([range_image_cartesian, range_image_tensor[..., 1:4]],
                   axis=-1),
@@ -133,7 +169,17 @@ def extract_points_from_range_image(laser, calibration, frame_pose):
 
 
 def extract_points(lasers, laser_calibrations, frame_pose):
-  """Extract point clouds."""
+  """提取所有激光传感器的点云并聚合。
+
+  Args:
+    lasers: Frame 中的 laser 列表。
+    laser_calibrations: 激光标定列表。
+    frame_pose: 帧位姿。
+
+  Returns:
+    dict: 含 points_xyz（[N,3]）与 points_feature（[N,2]，intensity 与 elongation）的
+        点云数据。注意 points_nlz（second-return 标记）被丢弃未返回。
+  """
   sort_lambda = lambda x: x.name
   lasers_with_calibration = zip(
       sorted(lasers, key=sort_lambda),
@@ -145,6 +191,7 @@ def extract_points(lasers, laser_calibrations, frame_pose):
     points_list = extract_points_from_range_image(laser, calibration,
                                                   frame_pose)
     points = np.concatenate(points_list, axis=0)
+    # 前 3 维为 xyz，3:5 为 intensity/elongation，第 5 维为 second-return 标记
     points_xyz.extend(points[..., :3].astype(np.float32))
     points_feature.extend(points[..., 3:5].astype(np.float32))
     points_nlz.extend(points[..., 5].astype(np.float32))
@@ -154,6 +201,15 @@ def extract_points(lasers, laser_calibrations, frame_pose):
   }
 
 def global_vel_to_ref(vel, global_from_ref_rotation):
+  """把全局系速度转为参考系速度（仅保留 x/y 分量，z 置零）。
+
+  Args:
+    vel (list): [speed_x, speed_y] 全局系速度。
+    global_from_ref_rotation (np.ndarray): [3,3] 参考系 -> 全局系的旋转矩阵。
+
+  Returns:
+    list: 参考系下的 [vx, vy, 0]。
+  """
   # inverse means ref_from_global, rotation_matrix for normalization
   vel = [vel[0], vel[1], 0]
   ref = np.dot(Quaternion(matrix=global_from_ref_rotation).inverse.rotation_matrix, vel) 
@@ -162,7 +218,16 @@ def global_vel_to_ref(vel, global_from_ref_rotation):
   return ref
 
 def extract_objects(laser_labels, global_from_ref_rotation):
-  """Extract objects."""
+  """解析标注中的 3D box、难度与速度。
+
+  Args:
+    laser_labels: Frame 中的激光标注列表。
+    global_from_ref_rotation (np.ndarray): [3,3] 参考系 -> 全局系的旋转矩阵。
+
+  Returns:
+    list: 每个目标的字典，box 为 [x,y,z,len,wid,hei,vel_x,vel_y,heading]（速度已
+        转到参考系），并含类别、点数与难度等信息。
+  """
   objects = []
   for object_id, label in enumerate(laser_labels):
     category_label = label.type

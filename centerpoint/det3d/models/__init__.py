@@ -1,3 +1,10 @@
+"""det3d.models 包入口：统一导出全部网络组件与构建器。
+
+按需导入 backbone（依赖 spconv）、bbox_heads、detectors、necks、readers、
+second_stage、roi_heads 等子模块，并导出各构建接口与注册表。检测到 spconv
+缺失时跳过稀疏卷积骨干并打印提示。
+"""
+
 import importlib
 spconv_spec = importlib.util.find_spec("spconv")
 found = spconv_spec is not None

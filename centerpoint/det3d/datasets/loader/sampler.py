@@ -1,3 +1,13 @@
+"""数据加载的采样器（Sampler）集合。
+
+提供分布式与按 group(长宽比/类别分组) 采样的 Sampler 实现，用于 DataLoader：
+    - DistributedSampler / DistributedSamplerV2: 将数据集按 rank 切分，保证多卡
+      各自消费互不重叠的子集。
+    - GroupSampler / DistributedGroupSampler: 依据 dataset.flag 分组，使同一 batch
+      内样本尽量来自同一组，减少 padding 浪费。
+
+这些采样器通过 epoch 作为随机种子，保证同一 epoch 各进程的洗牌顺序一致。
+"""
 from __future__ import division
 import math
 
@@ -14,18 +24,15 @@ from torch.utils.data import DistributedSampler as _DistributedSampler
 
 
 class DistributedSamplerV2(Sampler):
-    """Sampler that restricts data loading to a subset of the dataset.
-    It is especially useful in conjunction with
-    :class:`torch.nn.parallel.DistributedDataParallel`. In such case, each
-    process can pass a DistributedSampler instance as a DataLoader sampler,
-    and load a subset of the original dataset that is exclusive to it.
-    .. note::
-        Dataset is assumed to be of constant size.
-    Arguments:
-        dataset: Dataset used for sampling.
-        num_replicas (optional): Number of processes participating in
-            distributed training.
-        rank (optional): Rank of the current process within num_replicas.
+    """把数据加载限制到当前进程专属的子集（配合 DistributedDataParallel 使用）。
+
+    每个进程拿到互不重叠的样本子集；dataset 规模视为固定。
+
+    Args:
+        dataset: 被采样的数据集。
+        num_replicas (int, optional): 参与训练的进程数（默认取 world_size）。
+        rank (int, optional): 当前进程 rank（默认取 get_rank()）。
+        shuffle (bool): 是否打乱。
     """
 
     def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True):
@@ -46,19 +53,20 @@ class DistributedSamplerV2(Sampler):
         self.shuffle = shuffle
 
     def __iter__(self):
+        """按 epoch 确定性洗牌，补齐到可被 num_replicas 整除，再按 rank 步进取子集。"""
         if self.shuffle:
-            # deterministically shuffle based on epoch
+            # 以 epoch 为种子确定性洗牌，保证各进程同序
             g = torch.Generator()
             g.manual_seed(self.epoch)
             indices = torch.randperm(len(self.dataset), generator=g).tolist()
         else:
             indices = torch.arange(len(self.dataset)).tolist()
 
-        # add extra samples to make it evenly divisible
+        # 头尾补样，保证总长度可被 num_replicas 整除
         indices += indices[: (self.total_size - len(indices))]
         assert len(indices) == self.total_size
 
-        # subsample
+        # 按 rank 间隔取值，得到本进程子集
         indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
 
@@ -68,16 +76,19 @@ class DistributedSamplerV2(Sampler):
         return self.num_samples
 
     def set_epoch(self, epoch):
+        """设置当前 epoch，用于控制洗牌随机种子。"""
         self.epoch = epoch
 
 
 class DistributedSampler(_DistributedSampler):
+    """继承 PyTorch DistributedSampler，但保留 shuffle 参数并重写 __iter__。"""
+
     def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank)
         self.shuffle = shuffle
 
     def __iter__(self):
-        # deterministically shuffle based on epoch
+        # 以 epoch 为种子确定性洗牌
         if self.shuffle:
             g = torch.Generator()
             g.manual_seed(self.epoch)
@@ -85,11 +96,11 @@ class DistributedSampler(_DistributedSampler):
         else:
             indices = torch.arange(len(self.dataset)).tolist()
 
-        # add extra samples to make it evenly divisible
+        # 补齐到可整除
         indices += indices[: (self.total_size - len(indices))]
         assert len(indices) == self.total_size
 
-        # subsample
+        # 按 rank 取子集
         indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
 
@@ -97,6 +108,8 @@ class DistributedSampler(_DistributedSampler):
 
 
 class GroupSampler(Sampler):
+    """按 dataset.flag 分组采样，使同一 batch 的样本尽量属于同一组。"""
+
     def __init__(self, dataset, samples_per_gpu=1):
         assert hasattr(dataset, "flag")
         self.dataset = dataset
@@ -110,6 +123,7 @@ class GroupSampler(Sampler):
             )
 
     def __iter__(self):
+        """每组内补齐到 samples_per_gpu 的整数倍，再按 group 打乱后拼接。"""
         indices = []
         for i, size in enumerate(self.group_sizes):
             if size == 0:
@@ -137,18 +151,15 @@ class GroupSampler(Sampler):
 
 
 class DistributedGroupSampler(Sampler):
-    """Sampler that restricts data loading to a subset of the dataset.
-    It is especially useful in conjunction with
-    :class:`torch.nn.parallel.DistributedDataParallel`. In such case, each
-    process can pass a DistributedSampler instance as a DataLoader sampler,
-    and load a subset of the original dataset that is exclusive to it.
-    .. note::
-        Dataset is assumed to be of constant size.
-    Arguments:
-        dataset: Dataset used for sampling.
-        num_replicas (optional): Number of processes participating in
-            distributed training.
-        rank (optional): Rank of the current process within num_replicas.
+    """按 group 分组的分布式采样器。
+
+    在 GroupSampler 基础上再按 rank 切分，使各进程消费互不重叠的、组内对齐的样本子集。
+
+    Args:
+        dataset: 被采样的数据集。
+        samples_per_gpu (int): 每 GPU 的 batch 大小（组对齐粒度）。
+        num_replicas (int, optional): 进程数。
+        rank (int, optional): 当前进程 rank。
     """
 
     def __init__(self, dataset, samples_per_gpu=1, num_replicas=None, rank=None):
@@ -183,7 +194,7 @@ class DistributedGroupSampler(Sampler):
         self.total_size = self.num_samples * self.num_replicas
 
     def __iter__(self):
-        # deterministically shuffle based on epoch
+        # 以 epoch 为种子确定性洗牌
         g = torch.Generator()
         g.manual_seed(self.epoch)
 
@@ -209,7 +220,7 @@ class DistributedGroupSampler(Sampler):
             for j in range(i * self.samples_per_gpu, (i + 1) * self.samples_per_gpu)
         ]
 
-        # subsample
+        # 按 rank 偏移取本进程子集
         offset = self.num_samples * self.rank
         indices = indices[offset : offset + self.num_samples]
         assert len(indices) == self.num_samples
@@ -220,4 +231,5 @@ class DistributedGroupSampler(Sampler):
         return self.num_samples
 
     def set_epoch(self, epoch):
+        """设置当前 epoch，用于控制洗牌随机种子。"""
         self.epoch = epoch

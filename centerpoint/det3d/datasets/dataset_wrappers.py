@@ -1,3 +1,8 @@
+"""数据集包装器（ConcatDataset / RepeatDataset）。
+
+对多个数据集做拼接或对单个数据集做重复，兼容 group flag 的拼接，减少小数据集在
+epoch 间的数据加载开销。
+"""
 import numpy as np
 from torch.utils.data.dataset import ConcatDataset as _ConcatDataset
 
@@ -6,13 +11,10 @@ from .registry import DATASETS
 
 @DATASETS.register_module
 class ConcatDataset(_ConcatDataset):
-    """A wrapper of concatenated dataset.
-
-    Same as :obj:`torch.utils.data.dataset.ConcatDataset`, but
-    concat the group flag for image aspect ratio.
+    """拼接多个数据集，并拼接各自的 group flag。
 
     Args:
-        datasets (list[:obj:`Dataset`]): A list of datasets.
+        datasets (list): 数据集列表。
     """
 
     def __init__(self, datasets):
@@ -27,16 +29,13 @@ class ConcatDataset(_ConcatDataset):
 
 @DATASETS.register_module
 class RepeatDataset(object):
-    """A wrapper of repeated dataset.
+    """把数据集重复 times 次。
 
-    The length of repeated dataset will be `times` larger than the original
-    dataset. This is useful when the data loading time is long but the dataset
-    is small. Using RepeatDataset can reduce the data loading time between
-    epochs.
+    适用于数据集较小但加载耗时的场景，跨 epoch 复用同一数据集，减少加载时间。
 
     Args:
-        dataset (:obj:`Dataset`): The dataset to be repeated.
-        times (int): Repeat times.
+        dataset: 被重复的数据集。
+        times (int): 重复次数。
     """
 
     def __init__(self, dataset, times):

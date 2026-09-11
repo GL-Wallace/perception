@@ -1,3 +1,9 @@
+"""训练引擎包入口。
+
+聚合 Trainer、Hook 体系、checkpoint 读写、日志缓冲与优先级等基础设施，
+以统一的命名空间对外暴露，供训练脚本（如 det3d.torchie.apis.train）导入使用。
+"""
+
 from .checkpoint import (
     load_checkpoint,
     load_state_dict,

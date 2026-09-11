@@ -1,3 +1,13 @@
+"""卷积模块组装工具。
+
+提供按配置构建卷积层的 build_conv_layer，以及包含 conv / norm / activation 的
+通用 ConvModule，可按 order 灵活组合各子层顺序。
+
+主要函数 / 类：
+    - build_conv_layer: 按配置构建卷积层（Conv / ConvWS）。
+    - ConvModule: conv + norm + activation 的通用卷积块。
+"""
+
 import warnings
 
 import torch.nn as nn
@@ -14,13 +24,14 @@ conv_cfg = {
 
 
 def build_conv_layer(cfg, *args, **kwargs):
-    """ Build convolution layer
+    """按配置构建卷积层。
+
     Args:
-        cfg (None or dict): cfg should contain:
-            type (str): identify conv layer type.
-            layer args: args needed to instantiate a conv layer.
+        cfg (None or dict): 卷积配置，需含 type 字段；为 None 时默认 Conv。
+        *args / **kwargs: 传入卷积层构造函数的参数。
+
     Returns:
-        layer (nn.Module): created conv layer
+        nn.Module: 创建的卷积层。
     """
     if cfg is None:
         cfg_ = dict(type="Conv")
@@ -40,25 +51,22 @@ def build_conv_layer(cfg, *args, **kwargs):
 
 
 class ConvModule(nn.Module):
-    """A conv block that contains conv/norm/activation layers.
+    """包含 conv / norm / activation 的通用卷积块。
+
+    按 order 指定的顺序组合卷积、归一化与激活，支持自动处理 bias（归一化前置时
+    默认关闭卷积偏置）。
+
     Args:
-        in_channels (int): Same as nn.Conv2d.
-        out_channels (int): Same as nn.Conv2d.
-        kernel_size (int or tuple[int]): Same as nn.Conv2d.
-        stride (int or tuple[int]): Same as nn.Conv2d.
-        padding (int or tuple[int]): Same as nn.Conv2d.
-        dilation (int or tuple[int]): Same as nn.Conv2d.
-        groups (int): Same as nn.Conv2d.
-        bias (bool or str): If specified as `auto`, it will be decided by the
-            norm_cfg. Bias will be set as True if norm_cfg is None, otherwise
-            False.
-        conv_cfg (dict): Config dict for convolution layer.
-        norm_cfg (dict): Config dict for normalization layer.
-        activation (str or None): Activation type, "ReLU" by default.
-        inplace (bool): Whether to use inplace mode for activation.
-        order (tuple[str]): The order of conv/norm/activation layers. It is a
-            sequence of "conv", "norm" and "act". Examples are
-            ("conv", "norm", "act") and ("act", "conv", "norm").
+        in_channels (int): 输入通道数（同 nn.Conv2d）。
+        out_channels (int): 输出通道数。
+        kernel_size: 卷积核尺寸。
+        stride / padding / dilation / groups: 同 nn.Conv2d。
+        bias (bool | str): 'auto' 时依据是否含 norm 自动决定。
+        conv_cfg (dict): 卷积层配置。
+        norm_cfg (dict): 归一化层配置。
+        activation (str | None): 激活类型，仅支持 'relu'。
+        inplace (bool): 是否原地执行激活。
+        order (tuple[str]): conv / norm / act 的排列顺序。
     """
 
     def __init__(
@@ -77,6 +85,7 @@ class ConvModule(nn.Module):
         inplace=True,
         order=("conv", "norm", "act"),
     ):
+        """构造卷积块并按 order 组装 conv / norm / act 子层。"""
         super(ConvModule, self).__init__()
         assert conv_cfg is None or isinstance(conv_cfg, dict)
         assert norm_cfg is None or isinstance(norm_cfg, dict)
@@ -90,7 +99,7 @@ class ConvModule(nn.Module):
 
         self.with_norm = norm_cfg is not None
         self.with_activatation = activation is not None
-        # if the conv layer is before a norm layer, bias is unnecessary.
+        # 卷积后若紧跟归一化层，则卷积偏置冗余，默认关闭。
         if bias == "auto":
             bias = False if self.with_norm else True
         self.with_bias = bias
@@ -98,7 +107,7 @@ class ConvModule(nn.Module):
         if self.with_norm and self.with_bias:
             warnings.warn("ConvModule has norm and bias at the same time")
 
-        # build convolution layer
+        # 构建卷积层。
         self.conv = build_conv_layer(
             conv_cfg,
             in_channels,
@@ -110,7 +119,7 @@ class ConvModule(nn.Module):
             groups=groups,
             bias=bias,
         )
-        # export the attributes of self.conv to a higher level for convenience
+        # 将卷积层的属性提升到本层，便于外部访问。
         self.in_channels = self.conv.in_channels
         self.out_channels = self.conv.out_channels
         self.kernel_size = self.conv.kernel_size
@@ -121,9 +130,9 @@ class ConvModule(nn.Module):
         self.output_padding = self.conv.output_padding
         self.groups = self.conv.groups
 
-        # build normalization layers
+        # 构建归一化层。
         if self.with_norm:
-            # norm layer is after conv layer
+            # 归一化层位于卷积之后时，其通道数取输出通道，否则取输入通道。
             if order.index("norm") > order.index("conv"):
                 norm_channels = out_channels
             else:
@@ -131,9 +140,9 @@ class ConvModule(nn.Module):
             self.norm_name, norm = build_norm_layer(norm_cfg, norm_channels)
             self.add_module(self.norm_name, norm)
 
-        # build activation layer
+        # 构建激活层。
         if self.with_activatation:
-            # TODO: introduce `act_cfg` and supports more activation layers
+            # TODO: 后续可引入 act_cfg 支持更多激活类型。
             if self.activation not in ["relu"]:
                 raise ValueError(
                     "{} is currently not supported.".format(self.activation)
@@ -141,20 +150,32 @@ class ConvModule(nn.Module):
             if self.activation == "relu":
                 self.activate = nn.ReLU(inplace=inplace)
 
-        # Use msra init by default
+        # 默认使用 msra（kaiming）初始化。
         self.init_weights()
 
     @property
     def norm(self):
+        """返回归一化层。"""
         return getattr(self, self.norm_name)
 
     def init_weights(self):
+        """对卷积层用 kaiming 初始化，对归一化层做常量初始化。"""
         nonlinearity = "relu" if self.activation is None else self.activation
         kaiming_init(self.conv, nonlinearity=nonlinearity)
         if self.with_norm:
             constant_init(self.norm, 1, bias=0)
 
     def forward(self, x, activate=True, norm=True):
+        """按 order 依次执行 conv / norm / act。
+
+        Args:
+            x (Tensor): 输入。
+            activate (bool): 是否执行激活层。
+            norm (bool): 是否执行归一化层。
+
+        Returns:
+            Tensor: 输出特征。
+        """
         for layer in self.order:
             if layer == "conv":
                 x = self.conv(x)

@@ -1,3 +1,16 @@
+"""ResNet 2D backbone（备用）。
+
+作为 torchie 训练框架提供的经典 2D 特征提取网络备选实现，支持 18/34/50/101/152
+等深度，并可设置输出阶段、冻结层与 BN 冻结等选项。CenterPoint 主训练路径使用 3D
+backbone，本文件保留作备用。支持从 checkpoint 路径加载预训练权重初始化。
+
+主要类/函数：
+    - conv3x3: 构造 3x3 卷积。
+    - BasicBlock / Bottleneck: 两种残差块。
+    - make_res_layer: 组装一层（stage）残差块。
+    - ResNet: 完整 ResNet 结构。
+"""
+
 import logging
 
 import torch.nn as nn
@@ -21,6 +34,8 @@ def conv3x3(in_planes, out_planes, stride=1, dilation=1):
 
 
 class BasicBlock(nn.Module):
+    """ResNet 基础残差块，用于 ResNet-18/34。"""
+
     expansion = 1
 
     def __init__(
@@ -54,6 +69,7 @@ class BasicBlock(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
 
+        # 维度或分辨率不匹配时，用 1x1 卷积对齐捷径分支。
         if self.downsample is not None:
             residual = self.downsample(x)
 
@@ -64,6 +80,8 @@ class BasicBlock(nn.Module):
 
 
 class Bottleneck(nn.Module):
+    """ResNet 瓶颈残差块，用于 ResNet-50/101/152。"""
+
     expansion = 4
 
     def __init__(
@@ -76,10 +94,10 @@ class Bottleneck(nn.Module):
         style="pytorch",
         with_cp=False,
     ):
-        """Bottleneck block.
+        """瓶颈残差块。
 
-        If style is "pytorch", the stride-two layer is the 3x3 conv layer,
-        if it is "caffe", the stride-two layer is the first 1x1 conv layer.
+        style 为 "pytorch" 时，步长为 2 的卷积是 3x3 卷积；为 "caffe" 时，
+        步长为 2 的卷积是第一个 1x1 卷积。
         """
         super(Bottleneck, self).__init__()
         assert style in ["pytorch", "caffe"]
@@ -136,6 +154,7 @@ class Bottleneck(nn.Module):
 
             return out
 
+        # 开启 with_cp 且需要梯度时，通过 checkpoint 用时间换显存。
         if self.with_cp and x.requires_grad:
             out = cp.checkpoint(_inner_forward, x)
         else:
@@ -156,7 +175,9 @@ def make_res_layer(
     style="pytorch",
     with_cp=False,
 ):
+    """组装一个残差 stage：首块负责下采样，其余块保持分辨率。"""
     downsample = None
+    # 输入输出维度不一致或步长不为 1 时，需要 1x1 卷积对齐捷径分支。
     if stride != 1 or inplanes != planes * block.expansion:
         downsample = nn.Sequential(
             nn.Conv2d(
@@ -185,24 +206,20 @@ def make_res_layer(
 
 
 class ResNet(nn.Module):
-    """ResNet backbone.
+    """ResNet backbone。
 
     Args:
-        depth (int): Depth of resnet, from {18, 34, 50, 101, 152}.
-        num_stages (int): Resnet stages, normally 4.
-        strides (Sequence[int]): Strides of the first block of each stage.
-        dilations (Sequence[int]): Dilation of each stage.
-        out_indices (Sequence[int]): Output from which stages.
-        style (str): `pytorch` or `caffe`. If set to "pytorch", the stride-two
-            layer is the 3x3 conv layer, otherwise the stride-two layer is
-            the first 1x1 conv layer.
-        frozen_stages (int): Stages to be frozen (all param fixed). -1 means
-            not freezing any parameters.
-        bn_eval (bool): Whether to set BN layers as eval mode, namely, freeze
-            running stats (mean and var).
-        bn_frozen (bool): Whether to freeze weight and bias of BN layers.
-        with_cp (bool): Use checkpoint or not. Using checkpoint will save some
-            memory while slowing down the training speed.
+        depth (int): ResNet 深度，取值来自 {18, 34, 50, 101, 152}。
+        num_stages (int): 残差 stage 数量，通常为 4。
+        strides (Sequence[int]): 每个 stage 第一个块的步长。
+        dilations (Sequence[int]): 每个 stage 的膨胀率。
+        out_indices (Sequence[int]): 从哪些 stage 输出特征。
+        style (str): `pytorch` 或 `caffe`。设为 "pytorch" 时步长为 2 的层是
+            3x3 卷积，否则是第一个 1x1 卷积。
+        frozen_stages (int): 需要冻结的 stage 数（所有参数固定）。-1 表示不冻结。
+        bn_eval (bool): 是否将 BN 层设为 eval 模式，即冻结运行统计量（均值和方差）。
+        bn_frozen (bool): 是否冻结 BN 层的权重和偏置。
+        with_cp (bool): 是否使用 checkpoint。开启可节省显存，但会降低训练速度。
     """
 
     arch_settings = {
@@ -231,6 +248,7 @@ class ResNet(nn.Module):
             raise KeyError("invalid depth {} for resnet".format(depth))
         assert num_stages >= 1 and num_stages <= 4
         block, stage_blocks = self.arch_settings[depth]
+        # 仅保留前 num_stages 个 stage。
         stage_blocks = stage_blocks[:num_stages]
         assert len(strides) == len(dilations) == num_stages
         assert max(out_indices) < num_stages
@@ -271,6 +289,7 @@ class ResNet(nn.Module):
         self.feat_dim = block.expansion * 64 * 2 ** (len(stage_blocks) - 1)
 
     def init_weights(self, pretrained=None):
+        """初始化权重：可加载预训练 checkpoint，否则用 kaiming/常量初始化。"""
         if isinstance(pretrained, str):
             logger = logging.getLogger()
             load_checkpoint(self, pretrained, strict=False, logger=logger)
@@ -292,6 +311,7 @@ class ResNet(nn.Module):
         for i, layer_name in enumerate(self.res_layers):
             res_layer = getattr(self, layer_name)
             x = res_layer(x)
+            # 仅收集 out_indices 指定的 stage 输出。
             if i in self.out_indices:
                 outs.append(x)
         if len(outs) == 1:
@@ -300,6 +320,7 @@ class ResNet(nn.Module):
             return tuple(outs)
 
     def train(self, mode=True):
+        """切换训练/评估模式，并按需冻结 BN 与前若干 stage 的参数。"""
         super(ResNet, self).train(mode)
         if self.bn_eval:
             for m in self.modules():

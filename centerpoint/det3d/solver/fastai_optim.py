@@ -1,3 +1,16 @@
+"""fastai 风格优化器工具与包装。
+
+提供 FP16 模型参数 / FP32 主参数（master）的管理工具，以及 OptimWrapper /
+FastAIMixedOptim 优化器包装类，支持权重衰减、动量和混合精度训练。
+
+主要函数/类：
+    - split_bn_bias: 将层按 BN 与非 BN 拆分成两组。
+    - get_master: 生成 FP16 模型参数与 FP32 主参数列表。
+    - model_g2master_g / master2model: 模型与主参数间的梯度/参数拷贝。
+    - OptimWrapper: 优化器包装，简化超参数修改。
+    - FastAIMixedOptim: 混合精度优化器包装（FP32 主权重）。
+"""
+
 from collections import Iterable, defaultdict
 from copy import deepcopy
 from itertools import chain
@@ -15,7 +28,10 @@ except:
     bn_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,nn.modules.batchnorm._BatchNorm)
 
 def split_bn_bias(layer_groups):
-    "Split the layers in `layer_groups` into batchnorm (`bn_types`) and non-batchnorm groups."
+    """把每组层拆分为非 BN 组与 BN 组（bn_types）。
+
+    BN 层通常不施加权重衰减，分拆后便于分别设置超参数。
+    """
     split_groups = []
     for l in layer_groups:
         l1, l2 = [], []
@@ -29,13 +45,14 @@ def split_bn_bias(layer_groups):
 
 
 def get_master(layer_groups, flat_master: bool = False):
-    "Return two lists, one for the model parameters in FP16 and one for the master parameters in FP32."
+    """返回两个列表：FP16 模型参数与 FP32 主参数。"""
     split_groups = split_bn_bias(layer_groups)
     model_params = [
         [param for param in lg.parameters() if param.requires_grad]
         for lg in split_groups
     ]
     if flat_master:
+        # flat_master：每组参数展平为一个 1D 主参数。
         master_params = []
         for lg in model_params:
             if len(lg) != 0:
@@ -48,6 +65,7 @@ def get_master(layer_groups, flat_master: bool = False):
                 master_params.append([])
         return model_params, master_params
     else:
+        # 非 flat：逐参数复制为 FP32 主参数。
         master_params = [
             [param.clone().float().detach() for param in lg] for lg in model_params
         ]
@@ -58,7 +76,7 @@ def get_master(layer_groups, flat_master: bool = False):
 
 
 def model_g2master_g(model_params, master_params, flat_master: bool = False) -> None:
-    "Copy the `model_params` gradients to `master_params` for the optimizer step."
+    """把模型参数的梯度拷贝到主参数，供优化器更新使用。"""
     if flat_master:
         for model_group, master_group in zip(model_params, master_params):
             if len(master_group) != 0:
@@ -77,7 +95,7 @@ def model_g2master_g(model_params, master_params, flat_master: bool = False) -> 
 
 
 def master2model(model_params, master_params, flat_master: bool = False) -> None:
-    "Copy `master_params` to `model_params`."
+    """把主参数拷贝回模型参数。"""
     if flat_master:
         for model_group, master_group in zip(model_params, master_params):
             if len(model_group) != 0:
@@ -93,7 +111,7 @@ def master2model(model_params, master_params, flat_master: bool = False) -> None
 
 
 def listify(p=None, q=None):
-    "Make `p` listy and the same length as `q`."
+    """把 p 转换为列表，并使其长度与 q 一致（单元素时复制扩展）。"""
     if p is None:
         p = []
     elif isinstance(p, str):
@@ -108,7 +126,7 @@ def listify(p=None, q=None):
 
 
 def trainable_params(m: nn.Module):
-    "Return list of trainable params in `m`."
+    """返回模块 m 中所有可训练参数。"""
     res = filter(lambda p: p.requires_grad, m.parameters())
     return res
 
@@ -117,9 +135,9 @@ def is_tuple(x) -> bool:
     return isinstance(x, tuple)
 
 
-# copy from fastai.
+# 拷贝自 fastai。
 class OptimWrapper:
-    "Basic wrapper around `opt` to simplify hyper-parameters changes."
+    """优化器基础包装，简化超参数（lr/mom/wd/beta）的读取与修改。"""
 
     def __init__(self, opt, wd, true_wd: bool = False, bn_wd: bool = True):
         self.opt, self.true_wd, self.bn_wd = opt, true_wd, bn_wd
@@ -130,7 +148,7 @@ class OptimWrapper:
 
     @classmethod
     def create(cls, opt_func, lr, layer_groups, **kwargs):
-        "Create an `optim.Optimizer` from `opt_func` with `lr`. Set lr on `layer_groups`."
+        """用 opt_func 创建优化器，并为各层组设置学习率。"""
         split_groups = split_bn_bias(layer_groups)
         opt = opt_func([{"params": trainable_params(l), "lr": 0} for l in split_groups])
         opt = cls(opt, **kwargs)
@@ -138,7 +156,7 @@ class OptimWrapper:
         return opt
 
     def new(self, layer_groups):
-        "Create a new `OptimWrapper` from `self` with another `layer_groups` but the same hyper-parameters."
+        """基于自身超参数，用另一组层创建新的 OptimWrapper。"""
         opt_func = getattr(self, "opt_func", self.opt.__class__)
         split_groups = split_bn_bias(layer_groups)
         opt = opt_func([{"params": trainable_params(l), "lr": 0} for l in split_groups])
@@ -154,10 +172,10 @@ class OptimWrapper:
     def __repr__(self) -> str:
         return f"OptimWrapper over {repr(self.opt)}.\nTrue weight decay: {self.true_wd}"
 
-    # Pytorch optimizer methods
+    # PyTorch 优化器方法
     def step(self) -> None:
-        "Set weight decay and step optimizer."
-        # weight decay outside of optimizer step (AdamW)
+        """设置权重衰减并执行优化器更新。"""
+        # 在优化器外部施加权重衰减（AdamW 风格）
         if self.true_wd:
             for lr, wd, pg1, pg2 in zip(
                 self._lr,
@@ -174,20 +192,20 @@ class OptimWrapper:
         self.opt.step()
 
     def zero_grad(self) -> None:
-        "Clear optimizer gradients."
+        """清零优化器梯度。"""
         self.opt.zero_grad()
 
-    # Passthrough to the inner opt.
+    # 转发给内部优化器
     def __getattr__(self, k: str):
         return getattr(self.opt, k, None)
 
     def clear(self):
-        "Reset the state of the inner optimizer."
+        """重置内部优化器的状态。"""
         sd = self.state_dict()
         sd["state"] = {}
         self.load_state_dict(sd)
 
-    # Hyperparameters as properties
+    # 超参数以属性形式暴露
     @property
     def lr(self) -> float:
         return self._lr[-1]
@@ -214,7 +232,7 @@ class OptimWrapper:
 
     @beta.setter
     def beta(self, val: float) -> None:
-        "Set beta (or alpha as makes sense for given optimizer)."
+        """设置 beta（对某些优化器而言是 alpha）。"""
         if val is None:
             return
         if "betas" in self.opt_keys:
@@ -229,14 +247,14 @@ class OptimWrapper:
 
     @wd.setter
     def wd(self, val: float) -> None:
-        "Set weight decay."
+        """设置权重衰减。"""
         if not self.true_wd:
             self.set_val("weight_decay", listify(val, self._wd), bn_groups=self.bn_wd)
         self._wd = listify(val, self._wd)
 
-    # Helper functions
+    # 辅助函数
     def read_defaults(self) -> None:
-        "Read the values inside the optimizer for the hyper-parameters."
+        """从优化器读取各超参数默认值。"""
         self._beta = None
         if "lr" in self.opt_keys:
             self._lr = self.read_val("lr")
@@ -250,7 +268,7 @@ class OptimWrapper:
             self._wd = self.read_val("weight_decay")
 
     def set_val(self, key: str, val, bn_groups: bool = True):
-        "Set `val` inside the optimizer dictionary at `key`."
+        """在优化器字典的 key 位置设置值 val。"""
         if is_tuple(val):
             val = [(v1, v2) for v1, v2 in zip(*val)]
         for v, pg1, pg2 in zip(
@@ -262,7 +280,7 @@ class OptimWrapper:
         return val
 
     def read_val(self, key: str):
-        "Read a hyperparameter `key` in the optimizer dictionary."
+        """读取优化器字典中的超参数 key。"""
         val = [pg[key] for pg in self.opt.param_groups[::2]]
         if is_tuple(val[0]):
             val = [o[0] for o in val], [o[1] for o in val]
@@ -270,6 +288,8 @@ class OptimWrapper:
 
 
 class FastAIMixedOptim(OptimWrapper):
+    """混合精度优化器：模型保留 FP16 权重，优化在 FP32 主参数上进行。"""
+
     @classmethod
     def create(
         cls,
@@ -281,13 +301,13 @@ class FastAIMixedOptim(OptimWrapper):
         loss_scale=512.0,
         **kwargs,
     ):
-        "Create an `optim.Optimizer` from `opt_func` with `lr`. Set lr on `layer_groups`."
+        """用 opt_func 创建混合精度优化器，并设置各层组学习率。"""
         opt = OptimWrapper.create(opt_func, lr, layer_groups, **kwargs)
         opt.model_params, opt.master_params = get_master(layer_groups, flat_master)
         opt.flat_master = flat_master
         opt.loss_scale = loss_scale
         opt.model = model
-        # Changes the optimizer so that the optimization step is done in FP32.
+        # 重排优化器参数，使优化步在 FP32 上完成。
         # opt = self.learn.opt
         mom, wd, beta = opt.mom, opt.wd, opt.beta
         lrs = [lr for lr in opt._lr for _ in range(2)]
@@ -299,11 +319,15 @@ class FastAIMixedOptim(OptimWrapper):
         return opt
 
     def step(self):
+        """执行一步混合精度优化。
+
+        将模型梯度拷贝到主参数、按 loss_scale 缩放后更新，再把主参数写回模型。
+        """
         model_g2master_g(self.model_params, self.master_params, self.flat_master)
         for group in self.master_params:
             for param in group:
                 param.grad.div_(self.loss_scale)
         super(FastAIMixedOptim, self).step()
         self.model.zero_grad()
-        # Update the params from master to model.
+        # 将 FP32 主参数更新结果写回模型。
         master2model(self.model_params, self.master_params, self.flat_master)

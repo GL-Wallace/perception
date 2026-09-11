@@ -1,3 +1,15 @@
+"""配置加载与访问工具。
+
+提供训练配置的统一入口：支持从 python/yaml/json 文件加载配置，并以「字典 + 属性」
+两种方式访问配置项，是训练主循环读取模型、数据、优化器等配置的核心基础设施。
+
+主要类/函数：
+    - ConfigDict: 支持属性访问的字典，访问缺失键时报错而非静默返回。
+    - Config: 配置容器，负责文件的加载（.py 动态导入 / yaml/json 解析）、
+        原始文本保留与属性/下标访问。
+    - add_args: 将配置项自动注册为命令行参数。
+"""
+
 import os.path as osp
 import sys
 from argparse import ArgumentParser
@@ -10,6 +22,8 @@ from .path import check_file_exist
 
 
 class ConfigDict(Dict):
+    """支持属性访问的配置字典，访问缺失键时抛出 KeyError。"""
+
     def __missing__(self, name):
         raise KeyError(name)
 
@@ -26,10 +40,16 @@ class ConfigDict(Dict):
             ex = e
         else:
             return value
+        # 将缺失键的 KeyError 转为 AttributeError，使属性访问语义更直观。
         raise ex
 
 
 def add_args(parser, cfg, prefix=""):
+    """把配置中的项递归注册为命令行参数。
+
+    根据值的类型选择相应的 argparse 参数类型；嵌套 dict 会以点号拼接前缀递归展开，
+    从而允许命令行覆盖配置项。
+    """
     for k, v in cfg.items():
         if isinstance(v, str):
             parser.add_argument("--" + prefix + k)
@@ -49,11 +69,10 @@ def add_args(parser, cfg, prefix=""):
 
 
 class Config(object):
-    """A facility for config and config files.
+    """配置的容器与加载设施。
 
-    It supports common file formats as configs: python/json/yaml. The interface
-    is the same as a dict object and also allows access config values as
-    attributes.
+    支持将 python/json/yaml 作为配置文件。其使用方式与 dict 一致，同时允许以属性
+    方式访问配置值。
 
     Example:
         >>> cfg = Config(dict(a=1, b=dict(b1=[0, 1])))
@@ -76,16 +95,30 @@ class Config(object):
 
     @staticmethod
     def fromfile(filename):
+        """从配置文件加载并构造 Config。
+
+        .py 文件通过动态导入执行后收集其中的全局变量；yml/yaml/json 文件则
+        委托 fileio 的 load 解析。
+
+        Args:
+            filename (str): 配置文件路径。
+
+        Returns:
+            Config: 解析得到的配置对象。
+        """
         filename = osp.abspath(osp.expanduser(filename))
         check_file_exist(filename)
         if filename.endswith(".py"):
+            # 去掉 .py 后缀作为模块名，动态导入执行配置脚本。
             module_name = osp.basename(filename)[:-3]
             if "." in module_name:
                 raise ValueError("Dots are not allowed in config file path.")
             config_dir = osp.dirname(filename)
+            # 临时把配置所在目录加入 sys.path，以支持配置内的相对导入。
             sys.path.insert(0, config_dir)
             mod = import_module(module_name)
             sys.path.pop(0)
+            # 收集模块中不以双下划线开头的全局变量作为配置项。
             cfg_dict = {
                 name: value
                 for name, value in mod.__dict__.items()
@@ -101,8 +134,7 @@ class Config(object):
 
     @staticmethod
     def auto_argparser(description=None):
-        """Generate argparser from config file automatically (experimental)
-        """
+        """自动根据配置文件生成 argparser（实验性）。"""
         partial_parser = ArgumentParser(description=description)
         partial_parser.add_argument("config", help="config file path")
         cfg_file = partial_parser.parse_known_args()[0].config
@@ -122,6 +154,7 @@ class Config(object):
 
         super(Config, self).__setattr__("_cfg_dict", ConfigDict(cfg_dict))
         super(Config, self).__setattr__("_filename", filename)
+        # 保留配置文件的原始文本，便于记录/展示所用配置。
         if filename:
             with open(filename, "r") as f:
                 super(Config, self).__setattr__("_text", f.read())
@@ -149,6 +182,7 @@ class Config(object):
         return self._cfg_dict.__getitem__(name)
 
     def __setattr__(self, name, value):
+        # 写入的 dict 统一转成 ConfigDict，以保持属性访问能力。
         if isinstance(value, dict):
             value = ConfigDict(value)
         self._cfg_dict.__setattr__(name, value)

@@ -1,3 +1,9 @@
+"""nuScenes 数据集的 PyTorch Dataset 封装。
+
+NuScenesDataset 读取 nusc_common 生成的 infos pickle，作为可迭代数据集：训练时会
+做类别均衡采样，通过 pipeline 完成点云加载、多 sweep 聚合、体素化与标签分配；
+评测时把检测结果转换为 nuScenes 官方评测格式并调用评测器。
+"""
 import sys
 import pickle
 import json
@@ -28,6 +34,11 @@ from det3d.datasets.registry import DATASETS
 
 @DATASETS.register_module
 class NuScenesDataset(PointCloudDataset):
+    """nuScenes 3D 点云数据集，继承自 PointCloudDataset。
+
+    每个点含 5 维特征（x, y, z, intensity, ring_index）；开启 virtual（point
+    painting）时特征维数扩展到 16。
+    """
     NumPointFeatures = 5  # x, y, z, intensity, ring_index
 
     def __init__(
@@ -43,6 +54,19 @@ class NuScenesDataset(PointCloudDataset):
         load_interval=1,
         **kwargs,
     ):
+        """初始化数据集。
+
+        Args:
+            info_path (str): nusc_common 生成的 infos pickle 路径。
+            root_path (str): 数据集根目录。
+            nsweeps (int): 聚合的 sweep 数量（默认 0 用于捕获未显式设置的情况）。
+            cfg: 配置对象（本类中未直接使用）。
+            pipeline (list): 数据预处理 pipeline 配置列表。
+            class_names (list): 关心的类别名列表。
+            test_mode (bool): 是否评测模式。
+            version (str): nuScenes 数据集版本。
+            load_interval (int): 加载时下采样间隔。
+        """
         self.load_interval = load_interval 
         super(NuScenesDataset, self).__init__(
             root_path, info_path, pipeline, test_mode=test_mode, class_names=class_names
@@ -69,11 +93,20 @@ class NuScenesDataset(PointCloudDataset):
         self.eval_version = "detection_cvpr_2019"
 
     def reset(self):
+        """重新从全量样本中随机采样 self.frac 帧（用于周期性重采样）。"""
         self.logger.info(f"re-sample {self.frac} frames from full set")
         random.shuffle(self._nusc_infos_all)
         self._nusc_infos = self._nusc_infos_all[: self.frac]
 
     def load_infos(self, info_path):
+        """加载 infos 并组织 train/val 样本。
+
+        训练模式下对各类别做均衡采样：先统计各类别样本数量，再按占比倒数决定每类
+        保留的样本数（保证稀有类别也不会被忽略）。
+
+        Args:
+            info_path (str): infos pickle 路径。
+        """
 
         with open(self._info_path, "rb") as f:
             _nusc_infos_all = pickle.load(f)
@@ -120,6 +153,7 @@ class NuScenesDataset(PointCloudDataset):
                 self._nusc_infos = _nusc_infos_all
 
     def __len__(self):
+        """返回数据集样本数（首次访问时惰性加载 infos）。"""
 
         if not hasattr(self, "_nusc_infos"):
             self.load_infos(self._info_path)
@@ -128,6 +162,12 @@ class NuScenesDataset(PointCloudDataset):
 
     @property
     def ground_truth_annotations(self):
+        """生成评测所需格式的 GT 标注列表（仅保留有效类别与检测范围内的目标）。
+
+        Returns:
+            list 或 None: 每个样本的 GT 字典（bbox/alpha/occluded/truncated/name/
+                location/dimensions/rotation_y/token）；数据不含 gt_boxes 时返回 None。
+        """
         if "gt_boxes" not in self._nusc_infos[0]:
             return None
         cls_range_map = config_factory(self.eval_version).serialize()['class_range']
@@ -160,6 +200,14 @@ class NuScenesDataset(PointCloudDataset):
         return gt_annos
 
     def get_sensor_data(self, idx):
+        """构造第 idx 个样本的 res 字典并跑完 pipeline。
+
+        Args:
+            idx (int): 样本索引。
+
+        Returns:
+            dict: 经 pipeline 处理后的数据。
+        """
 
         info = self._nusc_infos[idx]
 
@@ -190,6 +238,16 @@ class NuScenesDataset(PointCloudDataset):
         return self.get_sensor_data(idx)
 
     def evaluation(self, detections, output_dir=None, testset=False):
+        """把检测结果转换为 nuScenes 官方评测格式并（可选）运行官方评测。
+
+        Args:
+            detections (dict): token -> 检测结果 的映射。
+            output_dir (str): 结果输出目录（保存预测 json 与指标）。
+            testset (bool): 是否为测试集（测试集不运行本地评测）。
+
+        Returns:
+            tuple: (res, None)，res 为各类别 AP 汇总字典或 None。
+        """
         version = self.version
         eval_set_map = {
             "v1.0-mini": "mini_val",

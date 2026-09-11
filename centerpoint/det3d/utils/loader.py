@@ -1,3 +1,15 @@
+"""动态模块加载工具。
+
+支持按文件路径导入 Python 模块：优先尝试通过 PYTHONPATH 进行常规 import，
+失败则用 importlib 直接按路径加载，并可选注册到 sys.modules 以便反射查找。
+
+主要函数：
+    - _get_possible_module_path: 从 PYTHONPATH 中收集可作为模块的路径。
+    - _get_regular_import_name: 计算路径对应的常规导入名。
+    - import_file: 按路径导入文件。
+    - import_name: 按名称导入模块的简单封装。
+"""
+
 import importlib
 import logging
 import os
@@ -10,6 +22,7 @@ CUSTOM_LOADED_MODULES = {}
 
 
 def _get_possible_module_path(paths):
+    """从给定路径列表收集可作为模块导入的路径（.py 或 .so 文件或目录）。"""
     ret = []
     for p in paths:
         p = Path(p)
@@ -21,6 +34,7 @@ def _get_possible_module_path(paths):
 
 
 def _get_regular_import_name(path, module_paths):
+    """根据文件路径与可能的模块搜索路径推导常规导入名（点分模块名）。"""
     path = Path(path)
     for mp in module_paths:
         mp = Path(mp)
@@ -37,6 +51,20 @@ def _get_regular_import_name(path, module_paths):
 
 
 def import_file(path, name: str = None, add_to_sys=True, disable_warning=False):
+    """按文件路径导入模块。
+
+    若能通过 PYTHONPATH 常规导入则直接导入；否则按路径加载。可选将模块注册到
+    sys.modules，便于后续通过反射查找其中定义的对象。
+
+    Args:
+        path: 文件路径。
+        name: 可选，指定模块名（默认取文件名 stem）。
+        add_to_sys: 是否注册到 sys.modules。
+        disable_warning: 是否关闭常规导入失败的告警。
+
+    Returns:
+        module: 导入得到的模块对象。
+    """
     global CUSTOM_LOADED_MODULES
     path = Path(path)
     module_name = path.stem
@@ -65,8 +93,8 @@ def import_file(path, name: str = None, add_to_sys=True, disable_warning=False):
             )
         )
 
-    if add_to_sys:  # this will enable find objects defined in a file.
-        # avoid replace system modules.
+    if add_to_sys:  # 注册到 sys.modules，便于反射查找文件中定义的对象。
+        # 避免覆盖系统模块。
         if module_name in sys.modules and module_name not in CUSTOM_LOADED_MODULES:
             raise ValueError(f"{module_name} exists in system.")
         CUSTOM_LOADED_MODULES[module_name] = module
@@ -75,5 +103,6 @@ def import_file(path, name: str = None, add_to_sys=True, disable_warning=False):
 
 
 def import_name(name, package=None):
+    """按名称导入模块的简单封装。"""
     module = importlib.import_module(name, package)
     return module

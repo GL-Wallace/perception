@@ -1,3 +1,8 @@
+"""nuScenes 数据集 CenterPoint 单阶段 PointPillars 配置（MVP 变体、非虚拟点、z 轴修正 BN/缩放）。
+
+PointPillars 主干 + CenterHead，仅加载激光雷达点（lidar_only=True、virtual=False）；
+assigner 显式带 pc_range/voxel_size，0.2 米柱、点云范围 ±51.2 米、10 帧输入。训练 20 epoch。
+"""
 import itertools
 import logging
 
@@ -14,12 +19,12 @@ tasks = [
 
 class_names = list(itertools.chain(*[t["class_names"] for t in tasks]))
 
-# training and testing settings
+# 训练与测试共用的目标分配器声明：此处仅转发任务列表，具体分配参数见下方 assigner。
 target_assigner = dict(
     tasks=tasks,
 )
 
-# model settings
+# 模型配置：reader 提取柱体特征，backbone+neck 编码 BEV 特征，bbox_head 输出中心热图与回归。
 model = dict(
     type="PointPillars",
     pretrained=None,
@@ -54,6 +59,8 @@ model = dict(
     ),
 )
 
+# 训练目标分配器：将 GT 目标中心映射到热图网格并构造回归目标（论文 Sec. 3.2）；
+# 热图与回归损失由检测头权值控制（论文 Sec. 3.3）。
 assigner = dict(
     target_assigner=target_assigner,
     out_size_factor=get_downsample_factor(model),
@@ -68,6 +75,7 @@ assigner = dict(
 
 train_cfg = dict(assigner=assigner)
 
+# 推理后处理：过滤中心点合法范围，再做旋转 NMS 去重并与置信度阈值比较。
 test_cfg = dict(
     post_center_limit_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
     max_per_img=500,
@@ -84,7 +92,7 @@ test_cfg = dict(
     voxel_size=[0.2, 0.2]
 )
 
-# dataset settings
+# 数据集配置：nuScenes 数据集，nsweeps=10 表示叠加 10 帧激光点云。
 dataset_type = "NuScenesDataset"
 nsweeps = 10
 data_root = "data/nuScenes"
@@ -169,6 +177,7 @@ train_anno = "data/nuScenes/infos_train_10sweeps_withvelo_filter_True.pkl"
 val_anno = "data/nuScenes/infos_val_10sweeps_withvelo_filter_True.pkl"
 test_anno = None
 
+# 数据加载器配置：每卡 batch 大小与数据加载线程数，以及 train/val/test 三个数据集实例。
 data = dict(
     samples_per_gpu=4,
     workers_per_gpu=8,
@@ -209,7 +218,7 @@ data = dict(
 
 
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
-# optimizer
+# 优化器与学习率：Adam 优化器配合 OneCycle 余弦学习率调度（lr_max 为峰值学习率）。
 optimizer = dict(
     type="adam", amsgrad=0.0, wd=0.01, fixed_wd=True, moving_average=False,
 )
@@ -227,7 +236,7 @@ log_config = dict(
     ],
 )
 # yapf:enable
-# runtime settings
+# 运行时配置：总训练轮数、GPU 数目、分布式后端与日志级别。
 total_epochs = 20
 device_ids = range(8)
 dist_params = dict(backend="nccl", init_method="env://")

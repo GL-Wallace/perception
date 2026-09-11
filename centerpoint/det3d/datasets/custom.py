@@ -1,3 +1,9 @@
+"""点云数据集的抽象基类。
+
+PointCloudDataset 定义所有点云数据集（Waymo/nuScenes 等）的公共接口：持有根目录、
+pipeline（Compose 实例），并声明子类需实现的 __len__/__getitem__/get_sensor_data/
+evaluation/ground_truth_annotations 等方法。
+"""
 import os.path as osp
 from pathlib import Path
 
@@ -10,10 +16,9 @@ from .pipelines import Compose
 
 @DATASETS.register_module
 class PointCloudDataset(Dataset):
-    """An abstract class representing a pytorch-like Dataset.
-    All other datasets should subclass it. All subclasses should override
-    ``__len__``, that provides the size of the dataset, and ``__getitem__``,
-    supporting integer indexing in range from 0 to len(self) exclusive.
+    """所有点云数据集应继承的抽象基类。
+
+    子类需实现 ``__len__`` 与 ``__getitem__``（支持从 0 到 len-1 的整数索引）。
     """
 
     NumPointFeatures = -1
@@ -28,6 +33,15 @@ class PointCloudDataset(Dataset):
         class_names=None,
         **kwrags
     ):
+        """初始化数据集。
+
+        Args:
+            root_path (str): 数据集根目录。
+            info_path (str): infos pickle 路径。
+            pipeline (list, optional): 数据预处理 pipeline 配置列表。
+            test_mode (bool): 是否评测模式。
+            class_names (list): 关心的类别名列表。
+        """
         self._info_path = info_path
         self._root_path = Path(root_path)
         self._class_names = class_names
@@ -42,19 +56,9 @@ class PointCloudDataset(Dataset):
             self.pipeline = Compose(pipeline)
 
     def __getitem__(self, index):
-        """This function is used for preprocess.
-        you need to create a input dict in this function for network inference.
-        format: {
-            anchors
-            voxels
-            num_points
-            coordinates
-            if training:
-                labels
-                reg_targets
-            [optional]anchors_mask, slow in SECOND v1.5, don't use this.
-            [optional]metadata, in kitti, image index is saved in metadata
-        }
+        """供预处理使用，需构造网络推理输入 dict（voxels/num_points/coordinates 等）。
+
+        训练时需额外提供 labels/reg_targets；metadata 中可附带 image index 等信息。
         """
         raise NotImplementedError
 
@@ -62,86 +66,27 @@ class PointCloudDataset(Dataset):
         raise NotImplementedError
 
     def get_sensor_data(self, query):
-        """Dataset must provide a unified function to get data.
-        Args:
-            query: int or dict. this param must support int for training.
-                if dict, should have this format (no example yet):
-                {
-                    sensor_name: {
-                        sensor_meta
-                    }
-                }
-                if int, will return all sensor data.
-                (TODO: how to deal with unsynchronized data?)
-        Returns:
-            sensor_data: dict.
-            if query is int (return all), return a dict with all sensors:
-            {
-                sensor_name: sensor_data
-                ...
-                metadata: ... (for kitti, contains image_idx)
-            }
+        """数据集需提供的统一取数接口。
 
-            if sensor is lidar (all lidar point cloud must be concatenated to one array):
-            e.g. If your dataset have two lidar sensor, you need to return a single dict:
-            {
-                "lidar": {
-                    "points": ...
-                    ...
-                }
-            }
-            sensor_data: {
-                points: [N, 3+]
-                [optional]annotations: {
-                    "boxes": [N, 7] locs, dims, yaw, in lidar coord system. must tested
-                        in provided visualization tools such as second.utils.simplevis
-                        or web tool.
-                    "names": array of string.
-                }
-            }
-            if sensor is camera (not used yet):
-            sensor_data: {
-                data: image string (array is too large)
-                [optional]annotations: {
-                    "boxes": [N, 4] 2d bbox
-                    "names": array of string.
-                }
-            }
-            metadata: {
-                # dataset-specific information.
-                # for kitti, must have image_idx for label file generation.
-                image_idx: ...
-            }
-            [optional]calib # only used for kitti
+        Args:
+            query: int 或 dict。int 表示返回全部传感器数据；dict 表示按传感器查询。
+
+        Returns:
+            dict: 传感器数据（lidar 点云与标注等）与 metadata。
         """
         raise NotImplementedError
 
     def evaluation(self, dt_annos, output_dir):
-        """Dataset must provide a evaluation function to evaluate model."""
+        """数据集需提供的评测接口。"""
         raise NotImplementedError
 
     @property
     def ground_truth_annotations(self):
-        """
-        If you want to eval by my KITTI eval function, you must
-        provide the correct format annotations.
-        ground_truth_annotations format:
-        {
-            bbox: [N, 4], if you fill fake data, MUST HAVE >25 HEIGHT!!!!!!
-            alpha: [N], you can use -10 to ignore it.
-            occluded: [N], you can use zero.
-            truncated: [N], you can use zero.
-            name: [N]
-            location: [N, 3] center of 3d box.
-            dimensions: [N, 3] dim of 3d box.
-            rotation_y: [N] angle.
-        }
-        all fields must be filled, but some fields can fill
-        zero.
-        """
+        """提供评测所需的 GT 标注（bbox/alpha/location/dimensions/rotation_y 等）。"""
         raise NotImplementedError
 
     def pre_pipeline(self, results):
+        """（图像数据集预留）填充 results 的通用字段。"""
         results["img_prefix"] = self.img_prefix
         results["seg_prefix"] = self.seg_prefix
         results["proposal_file"] = self.proposal_file
@@ -149,7 +94,7 @@ class PointCloudDataset(Dataset):
         results["mask_fields"] = []
 
     def _filter_imgs(self, min_size=32):
-        """Filter images too small."""
+        """过滤尺寸过小的图像（图像数据集预留）。"""
         valid_inds = []
         for i, img_info in enumerate(self.img_infos):
             if min(img_info["width"], img_info["height"]) >= min_size:
@@ -157,9 +102,9 @@ class PointCloudDataset(Dataset):
         return valid_inds
 
     def _set_group_flag(self):
-        """Set flag according to image aspect ratio.
-        Images with aspect ratio greater than 1 will be set as group 1,
-        otherwise group 0.
+        """设置 group 标记（当前实现为全 1，供分组采样器使用）。
+
+        点云数据集不使用长宽比分组，因此所有样本标记为同一组。
         """
         self.flag = np.ones(len(self), dtype=np.uint8)
         # self.flag = np.zeros(len(self), dtype=np.uint8)
@@ -169,6 +114,7 @@ class PointCloudDataset(Dataset):
         #         self.flag[i] = 1
 
     def prepare_train_input(self, idx):
+        """（预留）构造训练输入并跑 pipeline。"""
         raise NotImplementedError
 
         # img_info = self.img_infos[idx]
@@ -180,6 +126,7 @@ class PointCloudDataset(Dataset):
         # return self.pipeline(results)
 
     def prepare_test_input(self, idx):
+        """（预留）构造测试输入并跑 pipeline。"""
         raise NotImplementedError
 
         # img_info = self.img_infos[idx]

@@ -1,3 +1,8 @@
+"""数据集子包入口。
+
+对外暴露 NuScenesDataset/WaymoDataset、数据集包装器、采样器、DataLoader 构建函数
+与 DATASETS 注册表，并统一提供 build_dataset。
+"""
 from .builder import build_dataset
 
 # from .cityscapes import CityscapesDataset

@@ -9,12 +9,12 @@ tasks = [
 
 class_names = list(itertools.chain(*[t["class_names"] for t in tasks]))
 
-# training and testing settings
+# 训练与测试共用的目标分配器声明：此处仅转发任务列表，具体分配参数见下方 assigner。
 target_assigner = dict(
     tasks=tasks,
 )
 
-# model settings
+# 模型配置：reader 提取体素特征，backbone 稀疏卷积下采样，neck 融合多尺度，bbox_head 输出中心热图与回归。
 model = dict(
     type="VoxelNet",
     pretrained=None,
@@ -45,6 +45,8 @@ model = dict(
     ),
 )
 
+# 训练目标分配器：将 GT 目标中心映射到热图网格并构造回归目标（论文 Sec. 3.2）；
+# 热图与回归损失由检测头权值控制（论文 Sec. 3.3）。
 assigner = dict(
     target_assigner=target_assigner,
     out_size_factor=get_downsample_factor(model),
@@ -58,6 +60,7 @@ assigner = dict(
 train_cfg = dict(assigner=assigner)
 
 
+# 推理后处理：过滤中心点合法范围，再做旋转 NMS 去重并与置信度阈值比较，最后还原到点云坐标。
 test_cfg = dict(
     post_center_limit_range=[-80, -80, -10.0, 80, 80, 10.0],
     nms=dict(
@@ -199,7 +202,7 @@ log_config = dict(
     ],
 )
 # yapf:enable
-# runtime settings
+# 运行时配置：总训练轮数、GPU 数目、分布式后端与日志级别。
 total_epochs = 12
 device_ids = range(8)
 dist_params = dict(backend="nccl", init_method="env://")

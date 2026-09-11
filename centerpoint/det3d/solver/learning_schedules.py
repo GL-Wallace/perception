@@ -1,19 +1,39 @@
-"""PyTorch edition of TensorFlow learning schedule in tensorflow object
-detection API.
+"""TensorFlow Object Detection API 学习率调度的 PyTorch 版本。
+
+提供基于 torch.optim.Optimizer 的学习率调度器基类 _LRSchedulerStep 与
+Constant、ManualStepping、指数衰减（含 warmup）、余弦衰减（含 warmup）等策略。
+
+主要类：
+    - _LRSchedulerStep: 学习率调度基类。
+    - Constant: 恒定学习率。
+    - ManualStepping: 手动分段学习率。
+    - ExponentialDecayWithBurnin / ExponentialDecay: 指数衰减（前者带 warmup）。
+    - CosineDecayWithWarmup: 余弦衰减（带 warmup）。
 """
 import numpy as np
 from torch.optim.optimizer import Optimizer
 
 
 class _LRSchedulerStep(object):
+    """学习率调度基类。
+
+    记录各参数组初始学习率，并在 step() 时根据子类计算的新学习率更新优化器。
+
+    Args:
+        optimizer: torch.optim.Optimizer 实例。
+        last_step: 上一次的步数，-1 表示首次初始化。
+    """
+
     def __init__(self, optimizer, last_step=-1):
         if not isinstance(optimizer, Optimizer):
             raise TypeError("{} is not an Optimizer".format(type(optimizer).__name__))
         self.optimizer = optimizer
         if last_step == -1:
+            # 首次初始化：把当前 lr 记录为 initial_lr。
             for group in optimizer.param_groups:
                 group.setdefault("initial_lr", group["lr"])
         else:
+            # 恢复训练：要求参数组中已存在 initial_lr。
             for i, group in enumerate(optimizer.param_groups):
                 if "initial_lr" not in group:
                     raise KeyError(
@@ -39,6 +59,7 @@ class _LRSchedulerStep(object):
         raise NotImplementedError
 
     def step(self, step=None):
+        """推进调度器一步，为每个参数组设置新的学习率。"""
         if step is None:
             step = self.last_step + 1
         self.last_step = step
@@ -47,6 +68,8 @@ class _LRSchedulerStep(object):
 
 
 class Constant(_LRSchedulerStep):
+    """恒定学习率调度：始终保持 base_lr 不变。"""
+
     def __init__(self, optimizer, last_step=-1):
         super().__init__(optimizer, last_step)
 
@@ -55,9 +78,7 @@ class Constant(_LRSchedulerStep):
 
 
 class ManualStepping(_LRSchedulerStep):
-    """Pytorch edition of manual_stepping in tensorflow.
-    DON'T SUPPORT PARAM GROUPS.
-    """
+    """TensorFlow manual_stepping 的 PyTorch 版本。不支持参数组。"""
 
     def __init__(self, optimizer, boundaries, rates, last_step=-1):
         self._boundaries = boundaries
@@ -91,8 +112,7 @@ class ManualStepping(_LRSchedulerStep):
 
 
 class ExponentialDecayWithBurnin(_LRSchedulerStep):
-    """Pytorch edition of manual_stepping in tensorflow.
-    """
+    """带 warmup（burnin）的指数衰减学习率调度。"""
 
     def __init__(
         self,
@@ -114,6 +134,7 @@ class ExponentialDecayWithBurnin(_LRSchedulerStep):
         if self._burnin_learning_rate == 0:
             burnin_learning_rate = base_lr
         step = self.last_step
+        # 指数衰减后的学习率（注意：^ 为位异或，这里原样保留原实现）。
         post_burnin_learning_rate = base_lr * self._decay_factor ^ (
             step // self._decay_steps
         )
@@ -124,6 +145,16 @@ class ExponentialDecayWithBurnin(_LRSchedulerStep):
 
 
 class ExponentialDecay(_LRSchedulerStep):
+    """指数衰减学习率调度。
+
+    Args:
+        optimizer: torch.optim.Optimizer 实例。
+        learning_rate_decay_steps: 衰减周期步数。
+        learning_rate_decay_factor: 衰减因子。
+        staircase: 是否阶梯式衰减。
+        last_step: 上一次步数。
+    """
+
     def __init__(
         self,
         optimizer,
@@ -141,10 +172,12 @@ class ExponentialDecay(_LRSchedulerStep):
     def _get_lr_per_group(self, base_lr):
         step = self.last_step
         if self._staircase:
+            # 阶梯式：每 decay_steps 步指数衰减一次。
             post_burnin_learning_rate = base_lr * pow(
                 self._decay_factor, (step // self._decay_steps)
             )
         else:
+            # 连续式：按步数比例连续衰减。
             post_burnin_learning_rate = base_lr * pow(
                 self._decay_factor, (step / self._decay_steps)
             )
@@ -153,6 +186,18 @@ class ExponentialDecay(_LRSchedulerStep):
 
 
 class CosineDecayWithWarmup(_LRSchedulerStep):
+    """带 warmup 的余弦退火学习率调度。
+
+    warmup 阶段从 warmup_learning_rate 线性升温到 base_lr，之后按余弦退火衰减。
+
+    Args:
+        optimizer: torch.optim.Optimizer 实例。
+        total_steps: 调度总步数。
+        warmup_learning_rate: warmup 起始学习率。
+        warmup_steps: warmup 阶段的步数。
+        last_step: 上一次步数。
+    """
+
     def __init__(
         self, optimizer, total_steps, warmup_learning_rate, warmup_steps, last_step=-1
     ):
@@ -171,6 +216,7 @@ class CosineDecayWithWarmup(_LRSchedulerStep):
             )
 
         step = self.last_step
+        # 余弦退火阶段的学习率。
         learning_rate = (
             0.5
             * base_lr
@@ -184,6 +230,7 @@ class CosineDecayWithWarmup(_LRSchedulerStep):
             )
         )
         if self._warmup_steps > 0:
+            # warmup 阶段：线性插值升温。
             slope = (base_lr - self._warmup_learning_rate) / self._warmup_steps
             pre_cosine_learning_rate = slope * float(step) + self._warmup_learning_rate
             if step < self._warmup_steps:

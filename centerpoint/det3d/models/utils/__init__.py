@@ -1,3 +1,10 @@
+"""utils 子模块的统一导出。
+
+汇总卷积模块（ConvModule / build_conv_layer）、权重标准化卷积（ConvWS2d）、
+归一化（build_norm_layer）、权重初始化（*_init）、Scale，以及 misc 中的各类
+辅助类与函数（Sequential / GroupNorm / Empty 等）。
+"""
+
 from .conv_module import ConvModule, build_conv_layer
 from .conv_ws import ConvWS2d, conv_ws_2d
 from .misc import (

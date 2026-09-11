@@ -1,3 +1,15 @@
+"""VGG 2D backbone（备用）。
+
+作为 torchie 训练框架提供的经典 2D 特征提取网络备选实现，支持 11/13/16/19 等深度。
+CenterPoint 主训练路径使用 3D backbone，本文件保留作备用。支持从 checkpoint 路径
+加载预训练权重初始化。
+
+主要类/函数：
+    - conv3x3: 构造 3x3 卷积。
+    - make_vgg_layer: 组装一个 stage 的卷积/池化层序列。
+    - VGG: 完整 VGG 结构。
+"""
+
 import logging
 
 import torch.nn as nn
@@ -16,6 +28,7 @@ def conv3x3(in_planes, out_planes, dilation=1):
 def make_vgg_layer(
     inplanes, planes, num_blocks, dilation=1, with_bn=False, ceil_mode=False
 ):
+    """组装一个 VGG stage：若干组卷积（可选 BN）+ ReLU，最后接一个 2x2 池化。"""
     layers = []
     for _ in range(num_blocks):
         layers.append(conv3x3(inplanes, planes, dilation))
@@ -29,20 +42,18 @@ def make_vgg_layer(
 
 
 class VGG(nn.Module):
-    """VGG backbone.
+    """VGG backbone。
 
     Args:
-        depth (int): Depth of vgg, from {11, 13, 16, 19}.
-        with_bn (bool): Use BatchNorm or not.
-        num_classes (int): number of classes for classification.
-        num_stages (int): VGG stages, normally 5.
-        dilations (Sequence[int]): Dilation of each stage.
-        out_indices (Sequence[int]): Output from which stages.
-        frozen_stages (int): Stages to be frozen (all param fixed). -1 means
-            not freezing any parameters.
-        bn_eval (bool): Whether to set BN layers as eval mode, namely, freeze
-            running stats (mean and var).
-        bn_frozen (bool): Whether to freeze weight and bias of BN layers.
+        depth (int): VGG 深度，取值来自 {11, 13, 16, 19}。
+        with_bn (bool): 是否使用 BatchNorm。
+        num_classes (int): 分类类别数，小于等于 0 时不构建分类头。
+        num_stages (int): VGG stage 数量，通常为 5。
+        dilations (Sequence[int]): 每个 stage 的膨胀率。
+        out_indices (Sequence[int]): 从哪些 stage 输出特征。
+        frozen_stages (int): 需要冻结的 stage 数（所有参数固定）。-1 表示不冻结。
+        bn_eval (bool): 是否将 BN 层设为 eval 模式，即冻结运行统计量（均值和方差）。
+        bn_frozen (bool): 是否冻结 BN 层的权重和偏置。
     """
 
     arch_settings = {
@@ -86,6 +97,7 @@ class VGG(nn.Module):
         vgg_layers = []
         self.range_sub_modules = []
         for i, num_blocks in enumerate(self.stage_blocks):
+            # 每个 stage 的模块数：num_blocks 个卷积、（可选）BN 与 ReLU，最后加 1 个池化。
             num_modules = num_blocks * (2 + with_bn) + 1
             end_idx = start_idx + num_modules
             dilation = dilations[i]
@@ -100,9 +112,11 @@ class VGG(nn.Module):
             )
             vgg_layers.extend(vgg_layer)
             self.inplanes = planes
+            # 记录每个 stage 在展平的层列表中的起止下标，便于冻结/逐段前向。
             self.range_sub_modules.append([start_idx, end_idx])
             start_idx = end_idx
         if not with_last_pool:
+            # 去掉最后一个池化层，并同步修正最后一个 stage 的结束下标。
             vgg_layers.pop(-1)
             self.range_sub_modules[-1][1] -= 1
         self.module_name = "features"
@@ -120,6 +134,7 @@ class VGG(nn.Module):
             )
 
     def init_weights(self, pretrained=None):
+        """初始化权重：可加载预训练 checkpoint，否则按层类型分别初始化。"""
         if isinstance(pretrained, str):
             logger = logging.getLogger()
             load_checkpoint(self, pretrained, strict=False, logger=logger)
@@ -137,6 +152,7 @@ class VGG(nn.Module):
     def forward(self, x):
         outs = []
         vgg_layers = getattr(self, self.module_name)
+        # 按 stage 依次前向，并收集 out_indices 指定的中间输出。
         for i, num_blocks in enumerate(self.stage_blocks):
             for j in range(*self.range_sub_modules[i]):
                 vgg_layer = vgg_layers[j]
@@ -153,6 +169,7 @@ class VGG(nn.Module):
             return tuple(outs)
 
     def train(self, mode=True):
+        """切换训练/评估模式，并按需冻结 BN 与前若干 stage 的参数。"""
         super(VGG, self).train(mode)
         if self.bn_eval:
             for m in self.modules():

@@ -1,3 +1,14 @@
+"""nuScenes 数据集的 info 生成、坐标系变换与评测辅助工具。
+
+主要功能:
+    - create_nuscenes_infos / _fill_trainval_infos: 从 nuScenes devkit 生成
+      infos_train/val/test 的 pickle，包含当前帧点云、GT box 与多 sweep 对齐信息。
+    - _second_det_to_nusc_box / _lidar_nusc_box_to_global / eval_main: 将检测结果
+      转为 nuScenes 评测所需的 Box 对象与全局坐标系，并调用官方评测。
+
+内部约定: box 为 [x,y,z,dx,dy,dz,vx,vy,yaw]（yaw 从 y 轴负方向逆时针量取，即
+nuScenes yaw 取负后再减 pi/2）；lidar 点云以 LIDAR_TOP 车体坐标系为参考。
+"""
 import numpy as np
 import pickle
 
@@ -18,6 +29,7 @@ try:
 except:
     print("nuScenes devkit not Found!")
 
+# nuScenes 细粒度类别名 -> 检测类别名（ignore 表示不参与评测）
 general_to_detection = {
     "human.pedestrian.adult": "pedestrian",
     "human.pedestrian.child": "pedestrian",
@@ -44,6 +56,7 @@ general_to_detection = {
     "static_object.bicycle_rack": "ignore",
 }
 
+# 各类别不同属性（attribute）在训练集中的出现次数，用于评测时选择最常见属性
 cls_attr_dist = {
     "barrier": {
         "cycle.with_rider": 0,
@@ -158,6 +171,17 @@ cls_attr_dist = {
 }
 
 def _second_det_to_nusc_box(detection):
+    """把检测结果张量转换为 nuScenes devkit 的 Box 对象列表（lidar 坐标系）。
+
+    检测结果内部 yaw 约定为从 y 轴负方向逆时针，需逆变换回 nuScenes 的 yaw
+    （yaw_nusc = -yaw_internal - pi/2），并用四元数绕 z 轴构造朝向。
+
+    Args:
+        detection (dict): 含 box3d_lidar/scores/label_preds 张量的检测结果。
+
+    Returns:
+        list: 每项为 nuScenes utils.data_classes.Box 对象。
+    """
     box3d = detection["box3d_lidar"].detach().cpu().numpy()
     scores = detection["scores"].detach().cpu().numpy()
     labels = detection["label_preds"].detach().cpu().numpy()
@@ -179,6 +203,18 @@ def _second_det_to_nusc_box(detection):
 
 
 def _lidar_nusc_box_to_global(nusc, boxes, sample_token):
+    """把 lidar 坐标系下的 Box 变换到全局（地图）坐标系。
+
+    先经 calibrated_sensor 外参从 lidar -> ego，再经 ego_pose 从 ego -> global。
+
+    Args:
+        nusc: NuScenes devkit 实例。
+        boxes (list): lidar 坐标系下的 Box 列表。
+        sample_token (str): 样本 token（用于定位 LIDAR_TOP 的 sample_data）。
+
+    Returns:
+        list: 变换到全局坐标系的 Box 列表。
+    """
     try:
         s_record = nusc.get("sample", sample_token)
         sample_data_token = s_record["data"]["LIDAR_TOP"]
@@ -202,6 +238,14 @@ def _lidar_nusc_box_to_global(nusc, boxes, sample_token):
 
 
 def _get_available_scenes(nusc):
+    """过滤出 lidar 文件实际存在的场景（可能只下载了部分数据）。
+
+    Args:
+        nusc: NuScenes devkit 实例。
+
+    Returns:
+        list: 首帧 LIDAR_TOP 点云文件存在的场景列表。
+    """
     available_scenes = []
     print("total scene num:", len(nusc.scene))
     for scene in nusc.scene:
@@ -229,11 +273,18 @@ def get_sample_data(
     nusc, sample_data_token: str, selected_anntokens: List[str] = None
 ):
     """
-    Returns the data path as well as all annotations related to that sample_data.
-    Note that the boxes are transformed into the current sensor's coordinate frame.
-    :param sample_data_token: Sample_data token.
-    :param selected_anntokens: If provided only return the selected annotation.
-    :return: (data_path, boxes, camera_intrinsic <np.array: 3, 3>)
+    返回某个 sample_data 的点云路径，以及变换到当前传感器坐标系的全部相关标注。
+
+    注意 box 会被转换到当前传感器（lidar 或 camera）坐标系。
+
+    Args:
+        nusc: NuScenes devkit 实例。
+        sample_data_token (str): sample_data token。
+        selected_anntokens (List[str], optional): 若提供则只返回选定的标注。
+
+    Returns:
+        tuple: (data_path, boxes, camera_intrinsic)。camera_intrinsic 仅在相机
+            传感器时非空，为 [3,3] 内参矩阵；lidar 时为 None。
     """
 
     # Retrieve sensor & pose records
@@ -275,6 +326,20 @@ CAM_CHANS = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT', 'CAM_BACK', 'CAM_
 
 
 def get_lidar_to_image_transform(nusc, pointsensor,  camera_sensor):
+    """计算从 lidar 坐标系到各相机图像坐标系的变换矩阵与内参。
+
+    依次串联 lidar->ego、ego->global、global->相机帧 ego、相机 ego->camera 四个
+    齐次变换，得到 lidar 点云投影到每个相机所需的变换矩阵（用于 point painting）。
+
+    Args:
+        nusc: NuScenes devkit 实例。
+        pointsensor (dict): LIDAR_TOP 的 sample_data 记录。
+        camera_sensor (dict): 各相机通道的 sample_data 记录映射。
+
+    Returns:
+        tuple: (tms, intrinsics, cam_paths)，分别对齐到 CAM_CHANS 的变换矩阵列表、
+            相机内参列表与图像路径列表。
+    """
     tms = []
     intrinsics = []  
     cam_paths = [] 
@@ -322,6 +387,19 @@ def get_lidar_to_image_transform(nusc, pointsensor,  camera_sensor):
     return tms, intrinsics, cam_paths  
 
 def find_closet_camera_tokens(nusc, pointsensor, ref_sample):
+    """为某帧 lidar 寻找时间戳最近的各相机帧。
+
+    nuScenes 中相机帧率高于 lidar，需在每个相机通道上沿 prev 链回退（最多 6 帧），
+    找到时间戳与 lidar 最接近的相机 sample_data。
+
+    Args:
+        nusc: NuScenes devkit 实例。
+        pointsensor (dict): 某 sweep 的 sample_data 记录（用于取时间戳）。
+        ref_sample (dict): 当前参考样本（含各相机通道 token）。
+
+    Returns:
+        dict: {cam_chan: 最近的相机 sample_data 记录}。
+    """
     lidar_timestamp = pointsensor["timestamp"]
 
     min_cams = {} 
@@ -352,6 +430,23 @@ def find_closet_camera_tokens(nusc, pointsensor, ref_sample):
 
 
 def _fill_trainval_infos(nusc, train_scenes, val_scenes, test=False, nsweeps=10, filter_zero=True):
+    """遍历所有样本，生成 train/val 的 info 列表（含多 sweep 对齐与 GT box）。
+
+    对每个 LIDAR_TOP 样本：构造 info 并沿 prev 链回溯 nsweeps-1 个历史 sweep，
+    计算历史帧点云对齐到当前参考帧的 transform_matrix 与 time_lag；非 test 时把
+    lidar 坐标系 GT box 转为内部约定 [x,y,z,dx,dy,dz,vx,vy,yaw]。
+
+    Args:
+        nusc: NuScenes devkit 实例。
+        train_scenes (set): 训练场景 token 集合。
+        val_scenes (set): 验证场景 token 集合。
+        test (bool): 是否为测试集（不加载 GT）。
+        nsweeps (int): 聚合的 sweep 数量（含当前帧）。
+        filter_zero (bool): 是否过滤不含点（num_lidar_pts+num_radar_pts==0）的 GT。
+
+    Returns:
+        tuple: (train_nusc_infos, val_nusc_infos)。
+    """
     from nuscenes.utils.geometry_utils import transform_matrix
 
     train_nusc_infos = []
@@ -501,6 +596,7 @@ def _fill_trainval_infos(nusc, train_scenes, val_scenes, test=False, nsweeps=10,
             )
             names = np.array([b.name for b in ref_boxes])
             tokens = np.array([b.token for b in ref_boxes])
+            # 内部 yaw 约定：从 y 轴负方向逆时针量取，等价于 -nuScenes_yaw - pi/2
             gt_boxes = np.concatenate(
                 [locs, dims, velocity[:, :2], -rots - np.pi / 2], axis=1
             )
@@ -529,11 +625,15 @@ def _fill_trainval_infos(nusc, train_scenes, val_scenes, test=False, nsweeps=10,
 
 def quaternion_yaw(q: Quaternion) -> float:
     """
-    Calculate the yaw angle from a quaternion.
-    Note that this only works for a quaternion that represents a box in lidar or global coordinate frame.
-    It does not work for a box in the camera frame.
-    :param q: Quaternion of interest.
-    :return: Yaw angle in radians.
+    从四元数计算 yaw 角（绕 z 轴的偏航角，单位弧度）。
+
+    注意该函数只适用于表示 lidar 或全局坐标系下 box 朝向的四元数，不适用于相机坐标系。
+
+    Args:
+        q (Quaternion): 四元数。
+
+    Returns:
+        float: yaw 角（弧度）。
     """
 
     # Project into xy plane.
@@ -546,6 +646,17 @@ def quaternion_yaw(q: Quaternion) -> float:
 
 
 def create_nuscenes_infos(root_path, version="v1.0-trainval", nsweeps=10, filter_zero=True):
+    """生成 nuScenes 的 train/val/test 的 infos pickle。
+
+    依据 version 选择场景切分，过滤未下载的场景后，调用 _fill_trainval_infos
+    生成 info，并写入 infos_*.pkl 文件。
+
+    Args:
+        root_path (str): 数据集根目录（含 v1.0-* 标注目录）。
+        version (str): 数据集版本（v1.0-trainval / v1.0-test / v1.0-mini）。
+        nsweeps (int): 聚合的 sweep 数量。
+        filter_zero (bool): 是否过滤不含点的 GT。
+    """
     nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
     available_vers = ["v1.0-trainval", "v1.0-test", "v1.0-mini"]
     assert version in available_vers
@@ -608,6 +719,15 @@ def create_nuscenes_infos(root_path, version="v1.0-trainval", nsweeps=10, filter
 
 
 def eval_main(nusc, eval_version, res_path, eval_set, output_dir):
+    """调用 nuScenes 官方评测器计算指标。
+
+    Args:
+        nusc: NuScenes devkit 实例。
+        eval_version (str): 检测评测配置版本（如 detection_cvpr_2019）。
+        res_path (str): 预测结果 json 路径。
+        eval_set (str): 评测子集名称（如 mini_val / val / test）。
+        output_dir (str): 指标输出目录。
+    """
     # nusc = NuScenes(version=version, dataroot=str(root_path), verbose=True)
     cfg = config_factory(eval_version)
 

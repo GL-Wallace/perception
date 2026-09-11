@@ -1,3 +1,20 @@
+"""nuScenes 跟踪评估的主入口脚本。
+
+读取第一阶段检测结果（checkpoint 中的 JSON），按帧组织为时间序列，逐帧调用
+PubTracker.step_centertrack 得到跟踪结果，并以 nuScenes 官方格式写出
+tracking_result.json，最后调用 TrackingEval 计算跟踪指标（AMOTA/AMOTP 等）。
+
+主要函数：
+    - save_first_frame: 生成帧级元数据（首帧标记与时间戳）。
+    - main: 逐帧跟踪并写出结果。
+    - eval_tracking / eval: 调用官方评测计算指标。
+    - test_time: 多次运行统计最快 FPS。
+
+与其他模块关系：
+    - 依赖 pub_tracker.PubTracker 做跟踪；
+    - 依赖 nuscenes SDK 读取数据与官方评测。
+"""
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -20,6 +37,11 @@ import time
 from nuscenes.utils import splits
 
 def parse_args():
+    """解析命令行参数（工作目录、checkpoint、是否匈牙利匹配、max_age 等）。
+
+    Returns:
+        argparse.Namespace: 解析后的参数。
+    """
     parser = argparse.ArgumentParser(description="Tracking Evaluation")
     parser.add_argument("--work_dir", help="the dir to save logs and tracking results")
     parser.add_argument(
@@ -36,6 +58,7 @@ def parse_args():
 
 
 def save_first_frame():
+    """生成 frames_meta.json：记录每帧的 token、时间戳与是否为场景首帧。"""
     args = parse_args()
     nusc = NuScenes(version=args.version, dataroot=args.root, verbose=True)
     if args.version == 'v1.0-trainval':
@@ -57,7 +80,7 @@ def save_first_frame():
         frame['token'] = token
         frame['timestamp'] = timestamp 
 
-        # start of a sequence
+        # sample['prev'] 为空表示它是该场景序列的第一帧。
         if sample['prev'] == '':
             frame['first'] = True 
         else:
@@ -75,6 +98,11 @@ def save_first_frame():
 
 
 def main():
+    """逐帧执行跟踪，输出 nuScenes 官方格式的 tracking_result.json。
+
+    Returns:
+        float: 平均处理速度（FPS）。
+    """
     args = parse_args()
     print('Deploy OK')
 
@@ -97,13 +125,12 @@ def main():
     for i in range(size):
         token = frames[i]['token']
 
-        # reset tracking after one video sequence
+        # 每个新视频序列开始时重置跟踪器，避免跨场景错误关联。
         if frames[i]['first']:
-            # use this for sanity check to ensure your token order is correct
-            # print("reset ", i)
             tracker.reset()
             last_time_stamp = frames[i]['timestamp']
 
+        # 距上一帧的时间间隔（单位：秒，save_first_frame 中已把微秒换算为秒），供速度平移使用。
         time_lag = (frames[i]['timestamp'] - last_time_stamp) 
         last_time_stamp = frames[i]['timestamp']
 
@@ -112,6 +139,7 @@ def main():
         outputs = tracker.step_centertrack(preds, time_lag)
         annos = []
 
+        # 只输出 active 的轨迹；丢失但仍在保留期内的轨迹不输出到当前帧。
         for item in outputs:
             if item['active'] == 0:
                 continue 
@@ -153,6 +181,7 @@ def main():
     return speed
 
 def eval_tracking():
+    """对刚生成的 tracking_result.json 调用官方评测。"""
     args = parse_args()
     eval(os.path.join(args.work_dir, 'tracking_result.json'),
         "val",
@@ -161,6 +190,14 @@ def eval_tracking():
     )
 
 def eval(res_path, eval_set="val", output_dir=None, root_path=None):
+    """用 nuScenes 官方 TrackingEval 计算 AMOTA/AMOTP 等跟踪指标。
+
+    Args:
+        res_path (str): 跟踪结果 JSON 路径。
+        eval_set (str): 评测集（val/test）。
+        output_dir (str): 结果输出目录。
+        root_path (str): nuScenes 数据集根目录。
+    """
     from nuscenes.eval.tracking.evaluate import TrackingEval 
     from nuscenes.eval.common.config import config_factory as track_configs
 
@@ -179,6 +216,7 @@ def eval(res_path, eval_set="val", output_dir=None, root_path=None):
 
 
 def test_time():
+    """多次运行 main 统计最快的 FPS（用于性能测试）。"""
     speeds = []
     for i in range(3):
         speeds.append(main())

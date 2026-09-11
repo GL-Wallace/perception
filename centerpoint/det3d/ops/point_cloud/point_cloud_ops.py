@@ -1,3 +1,20 @@
+"""点云到体素的转换算子。
+
+利用 numba JIT 将原始点云按体素大小划分到规则网格中，输出每个体素内的点、
+体素坐标以及每个体素包含的点数，供后续 VoxelNet 风格的 3D 检测网络（如本仓库
+的 CenterPoint / SECOND backbone）使用。
+
+主要函数：
+    - points_to_voxel: 点云转体素的主入口，返回体素、坐标与每体素点数。
+    - _points_to_voxel_kernel / _points_to_voxel_reverse_kernel: JIT 内核，
+      分别输出 xyz 与 zyx 顺序的体素坐标。
+    - bound_points_jit: 判定点是否落在给定范围内。
+
+设计思路：
+    体素化在单个循环内完成，避免在 JIT 代码中创建大数组以控制内存与性能。
+    coor_to_voxelidx 表记录每个体素坐标对应的体素索引，减少查找开销。
+"""
+
 import time
 
 import numba
@@ -16,9 +33,15 @@ def _points_to_voxel_reverse_kernel(
     max_points=35,
     max_voxels=20000,
 ):
-    # put all computations to one loop.
-    # we shouldn't create large array in main jit code, otherwise
-    # reduce performance
+    """体素化 JIT 内核：输出 zyx 顺序的体素坐标。
+
+    与 _points_to_voxel_kernel 的区别在于，坐标按 z/y/x 倒序写入 coor，
+    用于需要 reverse_index 的场景（体素坐标与点云特征维度顺序不同）。
+
+    Returns:
+        int: 实际生成的体素数量（可能小于 max_voxels）。
+    """
+    # 所有计算放在单个循环中完成，避免在 JIT 主体中创建大数组以降低开销。
     N = points.shape[0]
     # ndim = points.shape[1] - 1
     ndim = 3
@@ -33,6 +56,7 @@ def _points_to_voxel_reverse_kernel(
     for i in range(N):
         failed = False
         for j in range(ndim):
+            # 计算点在体素网格中的索引，越界则跳过该点。
             c = np.floor((points[i, j] - coors_range[j]) / voxel_size[j])
             if c < 0 or c >= grid_size[j]:
                 failed = True
@@ -42,6 +66,7 @@ def _points_to_voxel_reverse_kernel(
             continue
         voxelidx = coor_to_voxelidx[coor[0], coor[1], coor[2]]
         if voxelidx == -1:
+            # 首次遇到该体素：分配新索引并记录坐标。
             voxelidx = voxel_num
             if voxel_num >= max_voxels:
                 continue 
@@ -67,11 +92,16 @@ def _points_to_voxel_kernel(
     max_points=35,
     max_voxels=20000,
 ):
-    # need mutex if write in cuda, but numba.cuda don't support mutex.
-    # in addition, pytorch don't support cuda in dataloader(tensorflow support this).
-    # put all computations to one loop.
-    # we shouldn't create large array in main jit code, otherwise
-    # decrease performance
+    """体素化 JIT 内核：输出 xyz 顺序的体素坐标。
+
+    对每个点计算体素索引并填充进对应体素；超过 max_points 或 max_voxels 会丢弃。
+
+    Returns:
+        int: 实际生成的体素数量。
+    """
+    # 若在 CUDA 上写入需要互斥锁，但 numba.cuda 不支持互斥锁；
+    # 且 PyTorch dataloader 不支持 CUDA，故这里运行在 CPU 上。
+    # 所有计算放在单个循环中完成，避免在 JIT 主体中创建大数组导致性能下降。
     N = points.shape[0]
     # ndim = points.shape[1] - 1
     ndim = 3
@@ -87,6 +117,7 @@ def _points_to_voxel_kernel(
     for i in range(N):
         failed = False
         for j in range(ndim):
+            # 计算点在体素网格中的索引，越界则跳过该点。
             c = np.floor((points[i, j] - coors_range[j]) / voxel_size[j])
             if c < 0 or c >= grid_size[j]:
                 failed = True
@@ -96,6 +127,7 @@ def _points_to_voxel_kernel(
             continue
         voxelidx = coor_to_voxelidx[coor[0], coor[1], coor[2]]
         if voxelidx == -1:
+            # 首次遇到该体素：分配新索引并记录坐标。
             voxelidx = voxel_num
             if voxel_num >= max_voxels:
                 continue 
@@ -112,30 +144,27 @@ def _points_to_voxel_kernel(
 def points_to_voxel(
     points, voxel_size, coors_range, max_points=35, reverse_index=True, max_voxels=20000
 ):
-    """convert kitti points(N, >=3) to voxels. This version calculate
-    everything in one loop. now it takes only 4.2ms(complete point cloud)
-    with jit and 3.2ghz cpu.(don't calculate other features)
-    Note: this function in ubuntu seems faster than windows 10.
+    """将 KITTI 点云 (N, >=3) 转换为体素。
+
+    此版本在单个循环中完成全部计算：在 3.2GHz CPU 上加 JIT 仅需约 4.2ms
+    （不含其他特征计算）。注意：本函数在 Ubuntu 上通常比 Windows 10 更快。
 
     Args:
-        points: [N, ndim] float tensor. points[:, :3] contain xyz points and
-            points[:, 3:] contain other information such as reflectivity.
-        voxel_size: [3] list/tuple or array, float. xyz, indicate voxel size
-        coors_range: [6] list/tuple or array, float. indicate voxel range.
-            format: xyzxyz, minmax
-        max_points: int. indicate maximum points contained in a voxel.
-        reverse_index: boolean. indicate whether return reversed coordinates.
-            if points has xyz format and reverse_index is True, output
-            coordinates will be zyx format, but points in features always
-            xyz format.
-        max_voxels: int. indicate maximum voxels this function create.
-            for second, 20000 is a good choice. you should shuffle points
-            before call this function because max_voxels may drop some points.
+        points: [N, ndim] 浮点张量，points[:, :3] 为 xyz 坐标，
+            points[:, 3:] 为反射率等其他信息。
+        voxel_size: [3] list/tuple/array，xyz 三个方向的体素尺寸。
+        coors_range: [6] list/tuple/array，体素范围，格式为 xyzxyz（前 3 个为最小角，
+            后 3 个为最大角）。
+        max_points: int，单个体素最多包含的点数。
+        reverse_index: bool，是否返回倒序坐标。若点为 xyz 格式且 reverse_index 为 True，
+            输出坐标将为 zyx 格式；但特征中的点仍保持 xyz 格式。
+        max_voxels: int，本函数最多创建的体素数量。对 SECOND 而言 20000 是合适取值；
+            由于体素数量受限可能丢弃部分点，调用前建议先对点云做 shuffle。
 
     Returns:
-        voxels: [M, max_points, ndim] float tensor. only contain points.
-        coordinates: [M, 3] int32 tensor.
-        num_points_per_voxel: [M] int32 tensor.
+        voxels: [M, max_points, ndim] 浮点张量，仅包含点数据。
+        coordinates: [M, 3] int32 张量，体素坐标。
+        num_points_per_voxel: [M] int32 张量，每个体素实际包含的点数。
     """
     if not isinstance(voxel_size, np.ndarray):
         voxel_size = np.array(voxel_size, dtype=points.dtype)
@@ -145,7 +174,7 @@ def points_to_voxel(
     voxelmap_shape = tuple(np.round(voxelmap_shape).astype(np.int32).tolist())
     if reverse_index:
         voxelmap_shape = voxelmap_shape[::-1]
-    # don't create large array in jit(nopython=True) code.
+    # 不在 JIT(nopython=True) 代码中创建大数组。
     num_points_per_voxel = np.zeros(shape=(max_voxels,), dtype=np.int32)
     coor_to_voxelidx = -np.ones(shape=voxelmap_shape, dtype=np.int32)
     voxels = np.zeros(
@@ -186,8 +215,18 @@ def points_to_voxel(
 
 @numba.jit(nopython=True)
 def bound_points_jit(points, upper_bound, lower_bound):
-    # to use nopython=True, np.bool is not supported. so you need
-    # convert result to np.bool after this function.
+    """判断点是否位于给定范围内。
+
+    Args:
+        points: [N, ndim] 点坐标数组。
+        upper_bound: [ndim] 各维度上界（不包含）。
+        lower_bound: [ndim] 各维度下界（包含）。
+
+    Returns:
+        np.ndarray: [N] int32 数组，1 表示点在范围内，0 表示越界。
+    """
+    # nopython=True 下 numba 不支持 np.bool，因此用 int32 标记，
+    # 需要在函数返回后自行转换为 bool。
     N = points.shape[0]
     ndim = points.shape[1]
     keep_indices = np.zeros((N,), dtype=np.int32)

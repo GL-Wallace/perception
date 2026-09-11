@@ -1,97 +1,13 @@
-"""\
-This module offser helpers for OSS operation.
+"""OSS（对象存储，brainpp 内部 S3 兼容服务）路径操作辅助类。
 
-Basic Use
-----------
-Create an :class:`OSSPath` object::
+提供 pathlib 风格的 OSSPath 类，封装对 OSS bucket/key 的上传、下载、删除、
+目录遍历等操作，供数据集/中间结果读写使用。
 
-    >>> p = OSSPath('s3://mybucket/myprefix/mykey.bin')
-    OSSPath('s3://mybucket/myprefix/mykey.bin')
-    >>> OSSPath() / "mybucket" / "myprefix" / "mykey.bin"
-    OSSPath('s3://mybucket/myprefix/mykey.bin')
+主要类:
+    - OSSPath: 表示一个 s3://bucket/key 的路径对象，支持路径拼接、属性查询、
+      上传/下载、删除与目录遍历。
 
-
-Querying object properies::
-
-    >>> p.exists()
-    True
-    >>> p.is_dir()
-    False
-    >>> p.is_file()
-    True
-    >>> p.get_size()
-    256
-
-Access path properties::
-
-    >>> p.bucket
-    "mybucket"
-    >>> p.key
-    "myprefix/mykey.bin"
-    >>> p.name
-    "mykey.bin"
-    >>> p.stem
-    "mykey"
-    >> p.suffix
-    ".bin"
-    >> p.suffixes
-    [".bin"]
-    >>> p.parent
-    OSSPath('s3://mybucket/myprefix')
-    >>> p.root
-    OSSPath('s3://mybucket')
-
-Uploading content to an object::
-
-    >>> p.put(b"some bytes\n")
-    True
-
-Uploading file to an object::
-
-    >>> p.put(open('/path/some/image.jpg', 'rb'))
-
-Reading an object::
-
-    >>> f = p.download()
-    >>> f.read()
-    b"some bytes"
-    >>> p.download(encoding='utf-8')
-    >>> f.read()
-    "some bytes"
-
-Deleting an object::
-
-    >>> p.delete()
-    True
-
-Path manipulations::
-
-    >>> p = OSSPath('s3://mybucket/myprefix/mykey.bin')
-    >>> p.with_name('mykey2.bin')
-    OSSPath("s3://mybucket/myprefix/mykey2.bin")
-    >>> p.with_suffix('.txt')
-    OSSPath("s3://mybucket/myprefix/mykey.txt")
-    >>> p.with_bucket('some_bucket')
-    OSSPath("s3://some_bucket/myprefix/mykey.txt")
-
-    >>> q = p.parent
-    >>> q
-    OSSPath('s3://mybucket/myprefix')
-    >>> q / "subfile.txt"
-    OSSPath("s3://mybucket/myprefix/subfile.txt")
-    >>> q / "subdir" / "subfile.txt"
-    OSSPath("s3://mybucket/myprefix/subdir/subfile.txt")
-    >>> q.joinpath("a", "b", "c")
-    OSSPath('s3://mybucket/myprefix/a/b/c')
-
-Directory-level operations::
-
-    >>> list(q.list_all())  # list all subfiles in all levels
-    >>> list(q.iter_dir())  # list subdirs and subfiles in one-level
-    >>> for root, dirs, files in q.walk(): print(files)  # recursively walk through directory
-    >>> q.rmtree()  # remove all subkeys of p
-
-
+方法 docstring 保留英文原文（节选自 pathlib/OSS 风格说明）。
 """
 import os
 import io
@@ -106,6 +22,7 @@ from botocore.errorfactory import ClientError
 
 
 def get_site():
+    """根据主机名推断当前站点名（brainpp 环境使用）。"""
     m = re.search(r"([^.]+)\.brainpp\.cn$", socket.getfqdn())
     if m:
         return m.group(1)
@@ -117,6 +34,12 @@ OSS_ENDPOINT = os.getenv(
 
 
 class OSSPath:
+    """pathlib 风格的 OSS 路径对象。
+
+    用 boto3 s3 客户端封装对 OSS 的访问，用 _key_parts 元组维护路径分量，
+    支持类似 pathlib.Path 的属性与操作（parent/name/suffix/stem、joinpath/除法、
+    上传/下载/删除/遍历等）。
+    """
 
     __slots__ = ("_client", "bucket", "_key_parts")
 

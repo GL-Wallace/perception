@@ -1,3 +1,25 @@
+"""VoxelNet 权重转换工具。
+
+读取旧版 VoxelNet 结构的 checkpoint，将其中 backbone.middle_conv.* 的参数名
+映射到新版 backbone 子模块命名（conv_input/conv1..conv4/extra_conv），其余
+键按原样加载，最终保存为 voxelnet_converted.pth 供新模型使用。
+
+主要函数：
+    - convert_state_dict: 将旧 state_dict 按键名映射后拷贝到目标模型。
+    - weights_to_cpu: 将 state_dict 张量搬到 CPU。
+    - save_checkpoint: 以 meta/state_dict 结构保存 checkpoint。
+    - parse_args: 解析命令行参数。
+    - main: 转换主流程，输出 <work_dir>/voxelnet_converted.pth。
+
+命令行参数：
+    config         配置文件路径（位置参数）。
+    --work_dir     输出目录。
+    --checkpoint   需要转换的旧 checkpoint 路径。
+
+注意：
+    键名映射规则写死在 convert_state_dict 中，仅适用于特定的 VoxelNet
+    层命名变更；转换失败时会打印不匹配的键信息。
+"""
 import argparse
 import copy
 from io import UnsupportedOperation
@@ -33,16 +55,23 @@ import pickle
 import time 
 
 def convert_state_dict(module, state_dict, strict=False, logger=None):
-    """Load state_dict into a module
+    """将（旧版）state_dict 加载到模块，并按需做 VoxelNet 键名映射。
+
+    Args:
+        module (torch.nn.Module): 目标模型。
+        state_dict (dict): 待加载的权重字典。
+        strict (bool): 存在不匹配键时是否抛出异常。
+        logger: 日志器；非 strict 且存在 logger 时记录警告。
     """
     unexpected_keys = []
     shape_mismatch_pairs = []
 
     own_state = module.state_dict()
     for name, param in state_dict.items():
-        # a hacky fixed to load a new voxelnet 
+        # 兼容旧版 VoxelNet 的 hack：将 backbone.middle_conv.* 映射到新命名
         if name not in own_state:
             if name[:20] == 'backbone.middle_conv':
+                # 解析 middle_conv 后的层序号
                 index = int(name[20:].split('.')[1])
 
                 if index in [0, 1, 2]:
@@ -71,7 +100,7 @@ def convert_state_dict(module, state_dict, strict=False, logger=None):
             unexpected_keys.append(name)
             continue
         if isinstance(param, torch.nn.Parameter):
-            # backwards compatibility for serialized parameters
+            # 兼容被序列化过的 Parameter（取其 .data）
             param = param.data
         if param.size() != own_state[name].size():
             shape_mismatch_pairs.append([name, own_state[name].size(), param.size()])
@@ -79,7 +108,7 @@ def convert_state_dict(module, state_dict, strict=False, logger=None):
         own_state[name].copy_(param)
 
     all_missing_keys = set(own_state.keys()) - set(state_dict.keys())
-    # ignore "num_batches_tracked" of BN layers
+    # 忽略 BN 层的 num_batches_tracked 计数
     missing_keys = [key for key in all_missing_keys if "num_batches_tracked" not in key]
 
     err_msg = []
@@ -112,6 +141,11 @@ def convert_state_dict(module, state_dict, strict=False, logger=None):
             print(err_msg)
 
 def parse_args():
+    """解析权重转换脚本的命令行参数。
+
+    Returns:
+        argparse.Namespace: 解析后的参数对象，含 config/work_dir/checkpoint。
+    """
     parser = argparse.ArgumentParser(description="Train a detector")
     parser.add_argument("config", help="train config file path")
     parser.add_argument("--work_dir", help="the dir to save logs and models")
@@ -123,13 +157,13 @@ def parse_args():
     return args
 
 def weights_to_cpu(state_dict):
-    """Copy a model state_dict to cpu.
+    """将模型 state_dict 拷贝到 CPU。
 
     Args:
-        state_dict (OrderedDict): Model weights on GPU.
+        state_dict (OrderedDict): 模型权重（可能位于 GPU）。
 
     Returns:
-        OrderedDict: Model weights on GPU.
+        OrderedDict: 位于 CPU 上的模型权重。
     """
     state_dict_cpu = OrderedDict()
     for key, val in state_dict.items():
@@ -138,16 +172,14 @@ def weights_to_cpu(state_dict):
 
 
 def save_checkpoint(model, filename, meta=None):
-    """Save checkpoint to file.
+    """将 checkpoint 保存为文件。
 
-    The checkpoint will have 3 fields: ``meta``, ``state_dict`` and
-    ``optimizer``. By default ``meta`` will contain version and time info.
+    checkpoint 包含 ``meta`` 与 ``state_dict`` 两个字段（默认 meta 含版本与时间）。
 
     Args:
-        model (Module): Module whose params are to be saved.
-        filename (str): Checkpoint filename.
-        optimizer (:obj:`Optimizer`, optional): Optimizer to be saved.
-        meta (dict, optional): Metadata to be saved in checkpoint.
+        model (Module): 需要保存参数的模型。
+        filename (str): checkpoint 文件名。
+        meta (dict, optional): 需要保存进 checkpoint 的元信息。
     """
     if meta is None:
         meta = {}
@@ -156,6 +188,7 @@ def save_checkpoint(model, filename, meta=None):
 
     torchie.mkdir_or_exist(osp.dirname(filename))
     if hasattr(model, "module"):
+        # 解包 DDP/DataParallel 的 module 属性，保存原始模型
         model = model.module
 
     checkpoint = {"meta": meta, "state_dict": weights_to_cpu(model.state_dict())}
@@ -164,10 +197,11 @@ def save_checkpoint(model, filename, meta=None):
 
 
 def main():
+    """权重转换主流程：加载旧 checkpoint、映射键名并保存新 checkpoint。"""
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
-    # update configs according to CLI args
+    # 用命令行参数覆盖配置中的 work_dir
     if args.work_dir is not None:
         cfg.work_dir = args.work_dir
 
@@ -176,6 +210,7 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     state_dict = checkpoint['state_dict']
 
+    # 若键名带 DataParallel 的 "module." 前缀则去掉
     if list(state_dict.keys())[0].startswith("module."):
         state_dict = {k[7:]: v for k, v in checkpoint["state_dict"].items()}
 

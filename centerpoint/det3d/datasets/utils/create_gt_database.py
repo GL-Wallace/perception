@@ -1,3 +1,8 @@
+"""GT 数据库（ground truth database）构建工具。
+
+离线遍历数据集，把每个 GT 框内的点云裁剪保存为 .bin 文件，并生成 dbinfos pickle，
+供训练时 Preprocess 阶段的 DB 采样（copy-paste 增强）使用。
+"""
 import pickle
 from pathlib import Path
 import os 
@@ -7,6 +12,7 @@ from det3d.core import box_np_ops
 from det3d.datasets.dataset_factory import get_dataset
 from tqdm import tqdm
 
+# 数据集类别名 -> 数据集类名
 dataset_name_map = {
     "NUSC": "NuScenesDataset",
     "WAYMO": "WaymoDataset"
@@ -24,6 +30,21 @@ def create_groundtruth_database(
     virtual=False,
     **kwargs,
 ):
+    """构建 GT 数据库并把结果写入磁盘。
+
+    用只含加载阶段的 pipeline 遍历整个数据集，对每个 GT 框裁剪框内点云（中心平移到
+    原点）保存为 .bin，并记录框信息到 dbinfos pickle。
+
+    Args:
+        dataset_class_name (str): 数据集类别名（NUSC / WAYMO）。
+        data_path (str): 数据集根目录。
+        info_path (str): infos pickle 路径。
+        used_classes (list, optional): 只处理这些类别（None 表示全部）。
+        db_path (str, optional): 数据库输出目录。
+        dbinfo_path (str, optional): dbinfos pickle 输出路径。
+        relative_path (bool): 保存到 dbinfos 的路径是否使用相对路径。
+        virtual (bool): 是否为 virtual(point painting) 模式。
+    """
     pipeline = [
         {
             "type": "LoadPointCloudFromFile",
@@ -90,6 +111,7 @@ def create_groundtruth_database(
             # all of them into a single folder
             # we randomly sample a few objects for gt augmentation
             # We keep all cyclist as they are rare 
+            # Waymo 目标数量巨大，无法全部入库；按帧号下采样（保留稀有类别 CYCLIST）
             if index % 4 != 0:
                 mask = (names == 'VEHICLE') 
                 mask = np.logical_not(mask)
@@ -124,6 +146,7 @@ def create_groundtruth_database(
 
                 filepath = os.path.join(str(db_path), names[i], filename)
                 gt_points = points[point_indices[:, i]]
+                # 把框内点云中心平移到原点，便于采样时叠加
                 gt_points[:, :3] -= gt_boxes[i, :3]
                 with open(filepath, "w") as f:
                     try:

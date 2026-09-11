@@ -1,3 +1,18 @@
+"""可变形卷积（DCN）与可调制可变形卷积（DCNv2）算子封装。
+
+基于 CUDA 扩展 deform_conv_cuda 实现前反向计算，并提供与 nn.Conv2d 风格一致的
+模块封装。deform_conv 学习采样点偏移；modulated_deform_conv 在此基础上额外
+学习每个采样点的调制权重（mask）。
+
+主要类/函数：
+    - DeformConvFunction: 可变形卷积的 autograd.Function 实现。
+    - ModulatedDeformConvFunction: 可调制可变形卷积的 autograd.Function 实现。
+    - DeformConv / DeformConvPack: 可变形卷积模块及其带 offset 学习层的封装。
+    - ModulatedDeformConv / ModulatedDeformConvPack: 可调制版本的模块封装。
+
+依赖 .so 扩展 deform_conv_cuda（由 setup.py 编译生成）。
+"""
+
 import math
 
 import torch
@@ -12,6 +27,10 @@ from . import deform_conv_cuda
 
 
 class DeformConvFunction(Function):
+    """可变形卷积的 autograd.Function 实现。
+
+    前向调用 CUDA 内核 deform_conv_forward_cuda，反向计算输入/偏移/权重的梯度。
+    """
 
     @staticmethod
     def forward(ctx,
@@ -24,6 +43,10 @@ class DeformConvFunction(Function):
                 groups=1,
                 deformable_groups=1,
                 im2col_step=64):
+        """前向：利用 offset 对采样点做可变形卷积。
+
+        仅支持 4D 输入与 CUDA 张量；im2col_step 需能整除 batch size。
+        """
         if input is not None and input.dim() != 4:
             raise ValueError(
                 'Expected 4D tensor as input, got {}D tensor instead.'.format(
@@ -60,6 +83,10 @@ class DeformConvFunction(Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
+        """反向：计算 input、offset 与 weight 的梯度。
+
+        返回的梯度数量与 forward 的参数数量一致，不需求梯度的项返回 None。
+        """
         input, offset, weight = ctx.saved_tensors
 
         grad_input = grad_offset = grad_weight = None
@@ -97,6 +124,7 @@ class DeformConvFunction(Function):
 
     @staticmethod
     def _output_size(input, weight, padding, dilation, stride):
+        """根据输入尺寸、卷积核与参数计算输出空间尺寸。"""
         channels = weight.size(0)
         output_size = (input.size(0), channels)
         for d in range(input.dim() - 2):
@@ -113,6 +141,10 @@ class DeformConvFunction(Function):
 
 
 class ModulatedDeformConvFunction(Function):
+    """可调制可变形卷积（DCNv2）的 autograd.Function 实现。
+
+    相比普通可变形卷积，额外引入 mask 对每个采样点做调制加权。
+    """
 
     @staticmethod
     def forward(ctx,
@@ -126,6 +158,7 @@ class ModulatedDeformConvFunction(Function):
                 dilation=1,
                 groups=1,
                 deformable_groups=1):
+        """前向：执行带调制权重的可变形卷积（仅支持 CUDA）。"""
         ctx.stride = stride
         ctx.padding = padding
         ctx.dilation = dilation
@@ -152,6 +185,7 @@ class ModulatedDeformConvFunction(Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
+        """反向：计算 input、offset、mask、weight 与 bias 的梯度。"""
         if not grad_output.is_cuda:
             raise NotImplementedError
         input, offset, mask, weight, bias = ctx.saved_tensors
@@ -174,6 +208,7 @@ class ModulatedDeformConvFunction(Function):
 
     @staticmethod
     def _infer_shape(ctx, input, weight):
+        """根据 2D 输入尺寸与卷积参数推断输出形状。"""
         n = input.size(0)
         channels_out = weight.size(0)
         height, width = input.shape[2:4]
@@ -190,6 +225,10 @@ modulated_deform_conv = ModulatedDeformConvFunction.apply
 
 
 class DeformConv(nn.Module):
+    """可变形卷积模块，接口与 nn.Conv2d 保持一致。
+
+    仅维护权重 weight，offset 由外部传入；不内置 bias。
+    """
 
     def __init__(self,
                  in_channels,
@@ -201,6 +240,19 @@ class DeformConv(nn.Module):
                  groups=1,
                  deformable_groups=1,
                  bias=False):
+        """初始化可变形卷积层。
+
+        Args:
+            in_channels (int): 输入通道数。
+            out_channels (int): 输出通道数。
+            kernel_size (int or tuple[int]): 卷积核尺寸。
+            stride (int or tuple[int]): 步长。
+            padding (int or tuple[int]): 填充。
+            dilation (int or tuple[int]): 空洞率。
+            groups (int): 分组卷积组数。
+            deformable_groups (int): 可变形分组数。
+            bias (bool): 是否使用 bias（当前实现强制为 False）。
+        """
         super(DeformConv, self).__init__()
 
         assert not bias
@@ -219,7 +271,7 @@ class DeformConv(nn.Module):
         self.dilation = _pair(dilation)
         self.groups = groups
         self.deformable_groups = deformable_groups
-        # enable compatibility with nn.Conv2d
+        # 与 nn.Conv2d 保持接口兼容
         self.transposed = False
         self.output_padding = _single(0)
 
@@ -230,6 +282,7 @@ class DeformConv(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """初始化权重为 [-stdv, stdv] 的均匀分布。"""
         n = self.in_channels
         for k in self.kernel_size:
             n *= k
@@ -237,8 +290,12 @@ class DeformConv(nn.Module):
         self.weight.data.uniform_(-stdv, stdv)
 
     def forward(self, x, offset):
-        # To fix an assert error in deform_conv_cuda.cpp:128
-        # input image is smaller than kernel
+        """执行可变形卷积。
+
+        当输入特征图小于卷积核时先补零再卷积，输出后裁剪回原尺寸，
+        以避免 CUDA 内核断言失败。
+        """
+        # 修复 deform_conv_cuda.cpp:128 的断言错误：输入特征图小于卷积核时统一补零。
         input_pad = (
             x.size(2) < self.kernel_size[0] or x.size(3) < self.kernel_size[1])
         if input_pad:
@@ -256,19 +313,18 @@ class DeformConv(nn.Module):
 
 
 class DeformConvPack(DeformConv):
-    """A Deformable Conv Encapsulation that acts as normal Conv layers.
+    """带 offset 学习层的可变形卷积封装，可像普通卷积层一样使用。
 
     Args:
-        in_channels (int): Same as nn.Conv2d.
-        out_channels (int): Same as nn.Conv2d.
-        kernel_size (int or tuple[int]): Same as nn.Conv2d.
-        stride (int or tuple[int]): Same as nn.Conv2d.
-        padding (int or tuple[int]): Same as nn.Conv2d.
-        dilation (int or tuple[int]): Same as nn.Conv2d.
-        groups (int): Same as nn.Conv2d.
-        bias (bool or str): If specified as `auto`, it will be decided by the
-            norm_cfg. Bias will be set as True if norm_cfg is None, otherwise
-            False.
+        in_channels (int): 同 nn.Conv2d。
+        out_channels (int): 同 nn.Conv2d。
+        kernel_size (int or tuple[int]): 同 nn.Conv2d。
+        stride (int or tuple[int]): 同 nn.Conv2d。
+        padding (int or tuple[int]): 同 nn.Conv2d。
+        dilation (int or tuple[int]): 同 nn.Conv2d。
+        groups (int): 同 nn.Conv2d。
+        bias (bool or str): 若指定为 `auto`，则由 norm_cfg 决定；norm_cfg 为
+            None 时 bias 置 True，否则置 False。
     """
 
     _version = 2
@@ -276,6 +332,7 @@ class DeformConvPack(DeformConv):
     def __init__(self, *args, **kwargs):
         super(DeformConvPack, self).__init__(*args, **kwargs)
 
+        # 额外卷积层学习每个采样点的 (x, y) 偏移。
         self.conv_offset = nn.Conv2d(
             self.in_channels,
             self.deformable_groups * 2 * self.kernel_size[0] *
@@ -287,6 +344,7 @@ class DeformConvPack(DeformConv):
         self.init_offset()
 
     def init_offset(self):
+        """将 offset 卷积层的权重与 bias 初始化为 0。"""
         self.conv_offset.weight.data.zero_()
         self.conv_offset.bias.data.zero_()
 
@@ -297,11 +355,11 @@ class DeformConvPack(DeformConv):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
+        """加载状态字典，兼容旧版本 offset 参数的键名。"""
         version = local_metadata.get('version', None)
 
         if version is None or version < 2:
-            # the key is different in early versions
-            # In version < 2, DeformConvPack loads previous benchmark models.
+            # 旧版本模型的键名不同，需要做键名迁移。
             if (prefix + 'conv_offset.weight' not in state_dict
                     and prefix[:-1] + '_offset.weight' in state_dict):
                 state_dict[prefix + 'conv_offset.weight'] = state_dict.pop(
@@ -324,6 +382,7 @@ class DeformConvPack(DeformConv):
 
 
 class ModulatedDeformConv(nn.Module):
+    """可调制可变形卷积模块，offset 与 mask 均由外部传入。"""
 
     def __init__(self,
                  in_channels,
@@ -335,6 +394,19 @@ class ModulatedDeformConv(nn.Module):
                  groups=1,
                  deformable_groups=1,
                  bias=True):
+        """初始化可调制可变形卷积层。
+
+        Args:
+            in_channels (int): 输入通道数。
+            out_channels (int): 输出通道数。
+            kernel_size (int or tuple[int]): 卷积核尺寸。
+            stride (int or tuple[int]): 步长。
+            padding (int or tuple[int]): 填充。
+            dilation (int or tuple[int]): 空洞率。
+            groups (int): 分组卷积组数。
+            deformable_groups (int): 可变形分组数。
+            bias (bool): 是否使用 bias。
+        """
         super(ModulatedDeformConv, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -345,7 +417,7 @@ class ModulatedDeformConv(nn.Module):
         self.groups = groups
         self.deformable_groups = deformable_groups
         self.with_bias = bias
-        # enable compatibility with nn.Conv2d
+        # 与 nn.Conv2d 保持接口兼容
         self.transposed = False
         self.output_padding = _single(0)
 
@@ -359,6 +431,7 @@ class ModulatedDeformConv(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """初始化权重（均匀分布）与 bias（置 0）。"""
         n = self.in_channels
         for k in self.kernel_size:
             n *= k
@@ -374,19 +447,18 @@ class ModulatedDeformConv(nn.Module):
 
 
 class ModulatedDeformConvPack(ModulatedDeformConv):
-    """A ModulatedDeformable Conv Encapsulation that acts as normal Conv layers.
+    """带 offset/mask 学习层的可调制可变形卷积封装，可像普通卷积层一样使用。
 
     Args:
-        in_channels (int): Same as nn.Conv2d.
-        out_channels (int): Same as nn.Conv2d.
-        kernel_size (int or tuple[int]): Same as nn.Conv2d.
-        stride (int or tuple[int]): Same as nn.Conv2d.
-        padding (int or tuple[int]): Same as nn.Conv2d.
-        dilation (int or tuple[int]): Same as nn.Conv2d.
-        groups (int): Same as nn.Conv2d.
-        bias (bool or str): If specified as `auto`, it will be decided by the
-            norm_cfg. Bias will be set as True if norm_cfg is None, otherwise
-            False.
+        in_channels (int): 同 nn.Conv2d。
+        out_channels (int): 同 nn.Conv2d。
+        kernel_size (int or tuple[int]): 同 nn.Conv2d。
+        stride (int or tuple[int]): 同 nn.Conv2d。
+        padding (int or tuple[int]): 同 nn.Conv2d。
+        dilation (int or tuple[int]): 同 nn.Conv2d。
+        groups (int): 同 nn.Conv2d。
+        bias (bool or str): 若指定为 `auto`，则由 norm_cfg 决定；norm_cfg 为
+            None 时 bias 置 True，否则置 False。
     """
 
     _version = 2
@@ -394,6 +466,7 @@ class ModulatedDeformConvPack(ModulatedDeformConv):
     def __init__(self, *args, **kwargs):
         super(ModulatedDeformConvPack, self).__init__(*args, **kwargs)
 
+        # 额外卷积层同时学习 offset（前 2/3）与 mask（后 1/3）。
         self.conv_offset = nn.Conv2d(
             self.in_channels,
             self.deformable_groups * 3 * self.kernel_size[0] *
@@ -405,11 +478,13 @@ class ModulatedDeformConvPack(ModulatedDeformConv):
         self.init_offset()
 
     def init_offset(self):
+        """将 offset/mask 卷积层的权重与 bias 初始化为 0。"""
         self.conv_offset.weight.data.zero_()
         self.conv_offset.bias.data.zero_()
 
     def forward(self, x):
         out = self.conv_offset(x)
+        # 输出按通道均分为三份：前两份拼成 offset，第三份经 sigmoid 作为 mask。
         o1, o2, mask = torch.chunk(out, 3, dim=1)
         offset = torch.cat((o1, o2), dim=1)
         mask = torch.sigmoid(mask)
@@ -419,12 +494,11 @@ class ModulatedDeformConvPack(ModulatedDeformConv):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
+        """加载状态字典，兼容旧版本 offset 参数的键名。"""
         version = local_metadata.get('version', None)
 
         if version is None or version < 2:
-            # the key is different in early versions
-            # In version < 2, ModulatedDeformConvPack
-            # loads previous benchmark models.
+            # 旧版本模型的键名不同，需要做键名迁移。
             if (prefix + 'conv_offset.weight' not in state_dict
                     and prefix[:-1] + '_offset.weight' in state_dict):
                 state_dict[prefix + 'conv_offset.weight'] = state_dict.pop(

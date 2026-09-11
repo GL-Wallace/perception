@@ -1,3 +1,9 @@
+"""nuScenes 数据集两阶段 CenterPoint 配置（虚拟点基础版）。
+
+基于 VoxelNet 单阶段检测结果，使用 BEVFeatureExtractor 在第一阶段框的面上采样
+点特征，经 RoIHead 做 IoU 引导的置信度与 box 精炼（论文 Sec 3.4）。第一阶段权重
+从 pretrained checkpoint 加载并 freeze，仅训练精炼头。训练 6 epoch。
+"""
 import itertools
 import logging
 

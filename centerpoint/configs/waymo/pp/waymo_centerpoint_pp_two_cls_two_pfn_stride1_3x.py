@@ -1,3 +1,10 @@
+"""Waymo 数据集 CenterPoint 单阶段 PointPillars 配置（两类别版本）。
+
+采用 PointPillars 主干：PillarFeatureNet 提取柱体特征（num_filters=[64, 64]、不含距离特征），
+RPN 融合下/上采样 BEV 特征，CenterHead 输出 VEHICLE/PEDESTRIAN 的中心热图与属性回归。
+体素尺寸 0.32x0.32x6.0 米，点云范围 ±74.88 米，单帧输入（nsweeps=1），未启用 GT-AUG。
+使用 Adam + OneCycle（峰值 lr=0.003）训练；当前 total_epochs=1、samples_per_gpu=1，适用于快速验证。
+"""
 import itertools
 import logging
 from det3d.utils.config_tool import get_downsample_factor
@@ -8,12 +15,12 @@ tasks = [
 
 class_names = list(itertools.chain(*[t["class_names"] for t in tasks]))
 
-# training and testing settings
+# 训练与测试共用的目标分配器声明：此处仅转发任务列表，具体分配参数见下方 assigner。
 target_assigner = dict(
     tasks=tasks,
 )
 
-# model settings
+# 模型配置：reader 提取柱体特征，backbone+neck 编码 BEV 特征，bbox_head 输出中心热图与回归。
 model = dict(
     type="PointPillars",
     pretrained=None,
@@ -47,6 +54,8 @@ model = dict(
     ),
 )
 
+# 训练目标分配器：将 GT 目标中心映射到热图网格并构造回归目标（论文 Sec. 3.2）；
+# dense_reg=1 表示在 1 倍步长处做密集回归，损失由 bbox_head 的 weight/code_weights 控制（论文 Sec. 3.3）。
 assigner = dict(
     target_assigner=target_assigner,
     out_size_factor=get_downsample_factor(model),
@@ -59,8 +68,10 @@ assigner = dict(
 
 train_cfg = dict(assigner=assigner)
 
+# 推理后处理：过滤中心点合法范围，再做 NMS 去重并与置信度阈值比较，最后还原到点云坐标。
 test_cfg = dict(
     post_center_limit_range=[-80, -80, -10.0, 80, 80, 10.0],
+    # NMS 参数：预选数量、保留数量上限与 IoU 阈值。
     nms=dict(
         nms_pre_max_size=4096,
         nms_post_max_size=500,
@@ -73,7 +84,7 @@ test_cfg = dict(
 )
 
 
-# dataset settings
+# 数据集配置：Waymo 数据集，nsweeps=1 表示仅使用单帧激光点云。
 dataset_type = "WaymoDataset"
 nsweeps = 1
 data_root = "data/Waymo"
@@ -93,6 +104,7 @@ val_preprocessor = dict(
     shuffle_points=False,
 )
 
+# 体素化参数：裁剪点云范围并划分为固定尺寸的柱体，限制每柱点数与最大柱数。
 voxel_generator = dict(
     range=[-74.88, -74.88, -2, 74.88, 74.88, 4.0],
     voxel_size=[0.32, 0.32, 6.0],
@@ -121,6 +133,7 @@ train_anno = "data/Waymo/infos_train_01sweeps_filter_zero_gt.pkl"
 val_anno = "data/Waymo/infos_val_01sweeps_filter_zero_gt.pkl"
 test_anno = None
 
+# 数据加载器配置：每卡 batch 大小、每卡数据加载线程数，以及 train/val/test 三个数据集实例。
 data = dict(
     samples_per_gpu=1,
     workers_per_gpu=8,
@@ -158,7 +171,7 @@ data = dict(
 
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
-# optimizer
+# 优化器与学习率：Adam 优化器配合 OneCycle 余弦学习率调度（lr_max 为峰值学习率）。
 optimizer = dict(
     type="adam", amsgrad=0.0, wd=0.01, fixed_wd=True, moving_average=False,
 )
@@ -176,7 +189,7 @@ log_config = dict(
     ],
 )
 # yapf:enable
-# runtime settings
+# 运行时配置：总训练轮数、GPU 数目、分布式后端与日志级别。
 total_epochs = 1
 device_ids = range(8)
 dist_params = dict(backend="nccl", init_method="env://")

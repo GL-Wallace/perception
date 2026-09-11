@@ -1,3 +1,9 @@
+"""数据格式化 pipeline 阶段（Reformat）。
+
+Reformat 是 pipeline 的最后一个阶段，把分散在 res 中的点云、voxels、targets 等
+打包成模型可直接消费的 data_bundle 字典。评测且开启 double_flip 时，会额外为
+y/x/xy 三种翻转版本各构造一个 data_bundle，返回列表供 TTA。
+"""
 from det3d import torchie
 import numpy as np
 import torch
@@ -6,17 +12,34 @@ from ..registry import PIPELINES
 
 
 class DataBundle(object):
+    """简单的数据打包容器（当前实际使用原生 dict，此类保留作为类型标记）。"""
+
     def __init__(self, data):
         self.data = data
 
 
 @PIPELINES.register_module
 class Reformat(object):
+    """把 res 整理为模型输入格式。
+
+    训练模式打包 voxels/coordinates/num_points/targets；评测模式打包原始点云，
+    若开启 double_flip 则返回 [原始, yflip, xflip, double_flip] 四个 data_bundle。
+    """
+
     def __init__(self, **kwargs):
         double_flip = kwargs.get('double_flip', False)
         self.double_flip = double_flip 
 
     def __call__(self, res, info):
+        """执行格式化打包。
+
+        Args:
+            res (dict): pipeline 前置阶段累积的结果。
+            info (dict): 样本 info。
+
+        Returns:
+            dict 或 list: 单个 data_bundle，或 double_flip 时的 data_bundle 列表。
+        """
         meta = res["metadata"]
         points = res["lidar"]["points"]
         

@@ -1,3 +1,9 @@
+"""nuScenes 数据集 VoxelNet 单阶段 CenterPoint 调试配置（0.075 体素，修复 BN 与 z 缩放）。
+
+使用 VoxelNet 主干（DynamicVoxelEncoder + SpMiddleResNetFHD + RPN），10 帧累积输入，
+CenterHead 回归含速度(vel)。train 数据 load_interval=1000 仅加载 1/1000 样本，
+用于快速验证数据流与训练有效性。训练 20 epoch。
+"""
 import itertools
 import logging
 

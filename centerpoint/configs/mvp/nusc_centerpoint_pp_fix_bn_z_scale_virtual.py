@@ -1,3 +1,9 @@
+"""nuScenes 数据集 PointPillars 单阶段 CenterPoint 配置（含虚拟点，修复 BN 与 z 缩放）。
+
+使用 PointPillars 主干（PillarFeatureNet + PointPillarsScatter），10 帧累积输入，
+10 类目标拆分为 6 个 task，CenterHead 回归含速度(vel)。开启虚拟点(virtual=True)
+改善稀疏输入下的检测。训练 20 epoch，Adam + OneCycle（峰值 lr=0.001）。
+"""
 import itertools
 import logging
 

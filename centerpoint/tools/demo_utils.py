@@ -1,4 +1,19 @@
-"""The following code is takend from the nuscenes-devkit"""
+"""BEV 可视化工具（源自 nuScenes devkit）。
+
+提供 3D 框数据结构 Box 与投影、渲染辅助函数，用于将点云、真值框与检测结果
+绘制成鸟瞰视角（BEV）图片，供 demo.py 等脚本调用。
+
+主要内容：
+    - view_points: 将 3D 点投影到 2D 平面。
+    - _second_det_to_nusc_box: 将 centerpoint 检测结果转换为 Box 列表。
+    - Box: 3D 框数据类，支持旋转、渲染为 matplotlib 或 OpenCV 图。
+    - visual: 绘制单帧 BEV 图（点云 + 真值框 + 预测框）并保存为 png。
+    - remove_close: 过滤掉离原点过近的点。
+
+注意：
+    本文件大部分代码拷贝自 nuScenes devkit，坐标约定以 nuScenes 为准
+    （x 向前、y 向左、z 向上）。
+"""
 
 import copy
 import os.path as osp
@@ -15,22 +30,21 @@ from matplotlib import pyplot as plt
 
 
 def view_points(points: np.ndarray, view: np.ndarray, normalize: bool) -> np.ndarray:
-    """
-    This is a helper class that maps 3d points to a 2d plane. It can be used to implement both perspective and
-    orthographic projections. It first applies the dot product between the points and the view. By convention,
-    the view should be such that the data is projected onto the first 2 axis. It then optionally applies a
-    normalization along the third dimension.
+    """将 3D 点映射到 2D 平面。
 
-    For a perspective projection the view should be a 3x3 camera matrix, and normalize=True
-    For an orthographic projection with translation the view is a 3x4 matrix and normalize=False
-    For an orthographic projection without translation the view is a 3x3 matrix (optionally 3x4 with last columns
-     all zeros) and normalize=False
+    先计算点与 view 矩阵的点积，约定投影结果落到前两个坐标轴上；随后可选地
+    沿第三维做归一化。可用于透视投影与正交投影。
 
-    :param points: <np.float32: 3, n> Matrix of points, where each point (x, y, z) is along each column.
-    :param view: <np.float32: n, n>. Defines an arbitrary projection (n <= 4).
-        The projection should be such that the corners are projected onto the first 2 axis.
-    :param normalize: Whether to normalize the remaining coordinate (along the third axis).
-    :return: <np.float32: 3, n>. Mapped point. If normalize=False, the third coordinate is the height.
+    Args:
+        points (np.ndarray): 形状 (3, n) 的点矩阵，每个点 (x, y, z) 沿列排列。
+        view (np.ndarray): 定义投影矩阵（n <= 4），投影后角点落到前两轴。
+            - 透视投影：view 为 3x3 相机矩阵，normalize=True；
+            - 带平移的正交投影：view 为 3x4 矩阵，normalize=False；
+            - 无平移的正交投影：view 为 3x3（或末列全 0 的 3x4），normalize=False。
+        normalize (bool): 是否对剩余坐标（第三维）做归一化。
+
+    Returns:
+        np.ndarray: 形状 (3, n) 的映射后点；normalize=False 时第三维为高度。
     """
 
     assert view.shape[0] <= 4
@@ -42,7 +56,7 @@ def view_points(points: np.ndarray, view: np.ndarray, normalize: bool) -> np.nda
 
     nbr_points = points.shape[1]
 
-    # Do operation in homogenous coordinates.
+    # 在齐次坐标下做投影运算
     points = np.concatenate((points, np.ones((1, nbr_points))))
     points = np.dot(viewpad, points)
     points = points[:3, :]
@@ -53,6 +67,17 @@ def view_points(points: np.ndarray, view: np.ndarray, normalize: bool) -> np.nda
     return points
 
 def _second_det_to_nusc_box(detection):
+    """将 centerpoint 检测结果转换为 nuScenes Box 列表。
+
+    Args:
+        detection (dict): 包含 box3d_lidar、scores、label_preds 的检测结果。
+
+    Returns:
+        List[Box]: 转换后的 Box 列表，包含位置、尺寸、朝向、类别、分数与速度。
+
+    注意:
+        这里将 lidar 坐标下的 yaw 统一旋转 -pi/2，对齐 nuScenes 的朝向约定。
+    """
     box3d = detection["box3d_lidar"]
     scores = detection["scores"]
     labels = detection["label_preds"]
@@ -74,7 +99,7 @@ def _second_det_to_nusc_box(detection):
 
 
 class Box:
-    """ Simple data class representing a 3d box including, label, score and velocity. """
+    """表示一个 3D 框的数据类，包含标签、分数与速度。"""
 
     def __init__(self,
                  center: List[float],
@@ -86,14 +111,15 @@ class Box:
                  name: str = None,
                  token: str = None):
         """
-        :param center: Center of box given as x, y, z.
-        :param size: Size of box in width, length, height.
-        :param orientation: Box orientation.
-        :param label: Integer label, optional.
-        :param score: Classification score, optional.
-        :param velocity: Box velocity in x, y, z direction.
-        :param name: Box name, optional. Can be used e.g. for denote category name.
-        :param token: Unique string identifier from DB.
+        Args:
+            center: 框中心，形如 x, y, z。
+            size: 框尺寸，形如 width, length, height。
+            orientation: 框朝向（四元数）。
+            label: 整数类别标签，可选。
+            score: 分类置信度，可选。
+            velocity: box 在 x, y, z 方向的速度。
+            name: 框名称，可用于表示类别名，可选。
+            token: 来自数据库的唯一字符串标识。
         """
         # print(center.shape)
         assert not np.any(np.isnan(center))
@@ -135,22 +161,26 @@ class Box:
     @property
     def rotation_matrix(self) -> np.ndarray:
         """
-        Return a rotation matrix.
-        :return: <np.float: 3, 3>. The box's rotation matrix.
+        Returns:
+            np.ndarray: 形状 (3, 3) 的旋转矩阵。
         """
         return self.orientation.rotation_matrix
 
     def translate(self, x: np.ndarray) -> None:
         """
-        Applies a translation.
-        :param x: <np.float: 3, 1>. Translation in x, y, z direction.
+        平移操作。
+
+        Args:
+            x: 形状 (3, 1)，沿 x, y, z 方向的平移量。
         """
         self.center += x
 
     def rotate(self, quaternion: Quaternion) -> None:
         """
-        Rotates box.
-        :param quaternion: Rotation to apply.
+        旋转操作。
+
+        Args:
+            quaternion: 要施加的旋转。
         """
         self.center = np.dot(quaternion.rotation_matrix, self.center)
         self.orientation = quaternion * self.orientation
@@ -158,23 +188,26 @@ class Box:
 
     def corners(self, wlh_factor: float = 1.0) -> np.ndarray:
         """
-        Returns the bounding box corners.
-        :param wlh_factor: Multiply w, l, h by a factor to scale the box.
-        :return: <np.float: 3, 8>. First four corners are the ones facing forward.
-            The last four are the ones facing backwards.
+        返回边界框的 8 个角点。
+
+        Args:
+            wlh_factor: 将 w、l、h 乘以该系数以缩放框。
+
+        Returns:
+            np.ndarray: 形状 (3, 8)。前四个角点朝前，后四个角点朝后。
         """
         w, l, h = self.wlh * wlh_factor
 
-        # 3D bounding box corners. (Convention: x points forward, y to the left, z up.)
+        # 3D 框角点在局部坐标下的定义（约定：x 向前、y 向左、z 向上）
         x_corners = l / 2 * np.array([1,  1,  1,  1, -1, -1, -1, -1])
         y_corners = w / 2 * np.array([1, -1, -1,  1,  1, -1, -1,  1])
         z_corners = h / 2 * np.array([1,  1, -1, -1,  1,  1, -1, -1])
         corners = np.vstack((x_corners, y_corners, z_corners))
 
-        # Rotate
+        # 旋转
         corners = np.dot(self.orientation.rotation_matrix, corners)
 
-        # Translate
+        # 平移
         x, y, z = self.center
         corners[0, :] = corners[0, :] + x
         corners[1, :] = corners[1, :] + y
@@ -184,8 +217,10 @@ class Box:
 
     def bottom_corners(self) -> np.ndarray:
         """
-        Returns the four bottom corners.
-        :return: <np.float: 3, 4>. Bottom corners. First two face forward, last two face backwards.
+        返回底部的四个角点。
+
+        Returns:
+            np.ndarray: 形状 (3, 4)。前两个朝前，后两个朝后。
         """
         return self.corners()[:, [2, 3, 7, 6]]
 
@@ -196,13 +231,15 @@ class Box:
                colors: Tuple = ('b', 'r', 'k'),
                linewidth: float = 2) -> None:
         """
-        Renders the box in the provided Matplotlib axis.
-        :param axis: Axis onto which the box should be drawn.
-        :param view: <np.array: 3, 3>. Define a projection in needed (e.g. for drawing projection in an image).
-        :param normalize: Whether to normalize the remaining coordinate.
-        :param colors: (<Matplotlib.colors>: 3). Valid Matplotlib colors (<str> or normalized RGB tuple) for front,
-            back and sides.
-        :param linewidth: Width in pixel of the box sides.
+        在 matplotlib 坐标轴上绘制该框。
+
+        Args:
+            axis: 需要绘制框的坐标轴。
+            view: 形状 (3, 3) 的投影矩阵（如做图像内投影时使用）。
+            normalize: 是否对剩余坐标归一化。
+            colors: 三个 matplotlib 颜色（str 或归一化 RGB 元组），
+                分别表示前面、后面与侧面。
+            linewidth: 框边线的像素宽度。
         """
         corners = view_points(self.corners(), view, normalize=normalize)[:2, :]
 
@@ -212,17 +249,17 @@ class Box:
                 axis.plot([prev[0], corner[0]], [prev[1], corner[1]], color=color, linewidth=linewidth)
                 prev = corner
 
-        # Draw the sides
+        # 绘制四条侧面棱
         for i in range(4):
             axis.plot([corners.T[i][0], corners.T[i + 4][0]],
                       [corners.T[i][1], corners.T[i + 4][1]],
                       color=colors[2], linewidth=linewidth)
 
-        # Draw front (first 4 corners) and rear (last 4 corners) rectangles(3d)/lines(2d)
+        # 绘制前面（前 4 角）与后面（后 4 角）的矩形（3D）/ 边线（2D）
         draw_rect(corners.T[:4], colors[0])
         draw_rect(corners.T[4:], colors[1])
 
-        # Draw line indicating the front
+        # 绘制指示朝向的线段
         center_bottom_forward = np.mean(corners.T[2:4], axis=0)
         center_bottom = np.mean(corners.T[[2, 3, 7, 6]], axis=0)
         axis.plot([center_bottom[0], center_bottom_forward[0]],
@@ -236,12 +273,14 @@ class Box:
                    colors: Tuple = ((0, 0, 255), (255, 0, 0), (155, 155, 155)),
                    linewidth: int = 2) -> None:
         """
-        Renders box using OpenCV2.
-        :param im: <np.array: width, height, 3>. Image array. Channels are in BGR order.
-        :param view: <np.array: 3, 3>. Define a projection if needed (e.g. for drawing projection in an image).
-        :param normalize: Whether to normalize the remaining coordinate.
-        :param colors: ((R, G, B), (R, G, B), (R, G, B)). Colors for front, side & rear.
-        :param linewidth: Linewidth for plot.
+        使用 OpenCV 绘制该框。
+
+        Args:
+            im: 形状 (width, height, 3) 的图像数组，通道为 BGR 顺序。
+            view: 形状 (3, 3) 的投影矩阵（如做图像内投影时使用）。
+            normalize: 是否对剩余坐标归一化。
+            colors: 三个 (R, G, B) 颜色，分别表示前面、侧面与后面。
+            linewidth: 线宽。
         """
         corners = view_points(self.corners(), view, normalize=normalize)[:2, :]
 
@@ -254,18 +293,18 @@ class Box:
                          color, linewidth)
                 prev = corner
 
-        # Draw the sides
+        # 绘制四条侧面棱
         for i in range(4):
             cv2.line(im,
                      (int(corners.T[i][0]), int(corners.T[i][1])),
                      (int(corners.T[i + 4][0]), int(corners.T[i + 4][1])),
                      colors[2][::-1], linewidth)
 
-        # Draw front (first 4 corners) and rear (last 4 corners) rectangles(3d)/lines(2d)
+        # 绘制前面（前 4 角）与后面（后 4 角）的矩形（3D）/ 边线（2D）
         draw_rect(corners.T[:4], colors[0][::-1])
         draw_rect(corners.T[4:], colors[1][::-1])
 
-        # Draw line indicating the front
+        # 绘制指示朝向的线段
         center_bottom_forward = np.mean(corners.T[2:4], axis=0)
         center_bottom = np.mean(corners.T[[2, 3, 7, 6]], axis=0)
         cv2.line(im,
@@ -275,17 +314,27 @@ class Box:
 
     def copy(self) -> 'Box':
         """
-        Create a copy of self.
-        :return: A copy.
+        返回自身的深拷贝。
         """
         return copy.deepcopy(self)
 
 
 def visual(points, gt_anno, det, i, eval_range=35, conf_th=0.5):
+    """将单帧点云、真值框与预测框绘制为 BEV 图并保存。
+
+    Args:
+        points (np.ndarray): 形状 (3+, N) 的点云，前两维为 BEV 坐标。
+        gt_anno (dict): 真值框（detection 结构）。
+        det (dict): 预测框（detection 结构）。
+        i (int): 帧序号，用于生成文件名 demo/file%02d.png。
+        eval_range (int): BEV 可视化的坐标范围半径。
+        conf_th (float): 预测框显示的置信度阈值。
+    """
     _, ax = plt.subplots(1, 1, figsize=(9, 9), dpi=200)
     points = remove_close(points, radius=3)
     points = view_points(points[:3, :], np.eye(4), normalize=False)
 
+    # 用点到原点的距离来映射颜色，越远越亮
     dists = np.sqrt(np.sum(points[:2, :] ** 2, axis=0))
     colors = np.minimum(1, dists / eval_range)
     ax.scatter(points[0, :], points[1, :], c=colors, s=0.2)
@@ -293,17 +342,17 @@ def visual(points, gt_anno, det, i, eval_range=35, conf_th=0.5):
     boxes_gt = _second_det_to_nusc_box(gt_anno)
     boxes_est = _second_det_to_nusc_box(det)
 
-    # Show GT boxes.
+    # 绘制真值框（红色）
     for box in boxes_gt:
         box.render(ax, view=np.eye(4), colors=('r', 'r', 'r'), linewidth=2)
 
-    # Show EST boxes.
+    # 绘制预测框（蓝色），仅显示高于阈值的框
     for box in boxes_est:
         if box.score >= conf_th:
             box.render(ax, view=np.eye(4), colors=('b', 'b', 'b'), linewidth=1)
 
 
-    axes_limit = eval_range + 3  # Slightly bigger to include boxes that extend beyond the range.
+    axes_limit = eval_range + 3  # 略大于评估范围，容纳超出范围的框
     ax.set_xlim(-axes_limit, axes_limit)
     ax.set_ylim(-axes_limit, axes_limit)
     plt.axis('off')
@@ -314,11 +363,14 @@ def visual(points, gt_anno, det, i, eval_range=35, conf_th=0.5):
 
 def remove_close(points, radius: float) -> None:
     """
-    Removes point too close within a certain radius from origin.
-    :param radius: Radius below which points are removed.
+    移除距原点一定半径内过近的点。
+
+    Args:
+        points (np.ndarray): 形状 (3, N) 的点云。
+        radius (float): 需要移除点的半径阈值。
     """
     x_filt = np.abs(points[0, :]) < radius
     y_filt = np.abs(points[1, :]) < radius
     not_close = np.logical_not(np.logical_and(x_filt, y_filt))
     points = points[:, not_close]
-    return points    
+    return points

@@ -1,3 +1,9 @@
+"""环境探测工具。
+
+用于查找本机的 Anaconda、CUDA 安装路径，检测 GPU 计算能力（sm_xx）并查询
+GPU 显存占用情况，供构建脚本与运行时使用。
+"""
+
 import glob
 import json
 import os
@@ -10,6 +16,7 @@ import fire
 
 
 def _get_info_from_anaconda_info(info, split=":"):
+    """解析 `conda info` 输出为 dict（多行值会转成列表）。"""
     info = info.strip("\n").replace(" ", "")
     info_dict = {}
     latest_key = ""
@@ -26,11 +33,12 @@ def _get_info_from_anaconda_info(info, split=":"):
 
 
 def find_anaconda():
-    # try find in default path
+    """查找 Anaconda 安装路径。"""
+    # 先尝试默认路径
     path = Path.home() / "anaconda3"
     if path.exists():
         return path
-    # try conda in cmd
+    # 再尝试命令行 conda info
     try:
         info = subprocess.check_output("conda info", shell=True).decode("utf-8")
         info_dict = _get_info_from_anaconda_info(info)
@@ -40,11 +48,11 @@ def find_anaconda():
 
 
 def find_cuda():
-    """Finds the CUDA install path."""
-    # Guess #1
+    """查找 CUDA 安装路径。"""
+    # 猜测一：从环境变量读取
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home is None:
-        # Guess #2
+        # 猜测二：按平台默认安装路径
         if sys.platform == "win32":
             cuda_homes = glob.glob(
                 "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*.*"
@@ -56,7 +64,7 @@ def find_cuda():
         else:
             cuda_home = "/usr/local/cuda"
         if not os.path.exists(cuda_home):
-            # Guess #3
+            # 猜测三：通过 nvcc 可执行文件定位
             try:
                 which = "where" if sys.platform == "win32" else "which"
                 nvcc = subprocess.check_output([which, "nvcc"]).decode().rstrip("\r\n")
@@ -71,8 +79,13 @@ def find_cuda():
 
 
 def find_cuda_device_arch():
+    """检测当前 GPU 的 CUDA 计算能力。
+
+    先尝试使用 CUDA 自带的 deviceQuery 工具；失败则编译一段临时 CUDA 程序查询，
+    并根据 nvcc 支持的架构版本回退降级，返回如 "sm_75" 的字符串，失败返回 None。
+    """
     if sys.platform == "win32":
-        # TODO: add windows support
+        # TODO: 暂不支持 Windows
         return None
     cuda_home = find_cuda()
     if cuda_home is None:
@@ -81,6 +94,7 @@ def find_cuda_device_arch():
     try:
         device_query_path = cuda_home / "extras/demo_suite/deviceQuery"
         if not device_query_path.exists():
+            # 编译临时程序查询设备计算能力。
             source = """
             #include <cuda_runtime.h>
             #include <iostream>
@@ -100,7 +114,7 @@ def find_cuda_device_arch():
                 f.write(source)
                 f.flush()
                 try:
-                    # TODO: add windows support
+                    # TODO: 暂不支持 Windows
                     cmd = (
                         f"g++ {f.name} -o {f_path.stem}"
                         f" -I{cuda_home / 'include'} -L{cuda_home / 'lib64'} -lcudart"
@@ -131,6 +145,7 @@ def find_cuda_device_arch():
         arch_list = [int(s) for s in arch.split(".")]
         arch_int = arch_list[0] * 10 + arch_list[1]
         find_work_arch = False
+        # 从当前架构向下回退，找到 nvcc 支持的架构。
         while arch_int > 10:
             try:
                 res = subprocess.check_output(
@@ -159,13 +174,15 @@ def find_cuda_device_arch():
 
 
 def get_gpu_memory_usage():
+    """查询各 GPU 的空闲/总显存（字节），以 JSON 数组返回；失败返回 None。"""
     if sys.platform == "win32":
-        # TODO: add windows support
+        # TODO: 暂不支持 Windows
         return None
     cuda_home = find_cuda()
     if cuda_home is None:
         return None
     cuda_home = Path(cuda_home)
+    # 编译临时 CUDA 程序查询显存。
     source = """
     #include <cuda_runtime.h>
     #include <iostream>
@@ -173,7 +190,7 @@ def get_gpu_memory_usage():
         int nDevices;
         cudaGetDeviceCount(&nDevices);
         size_t free_m, total_m;
-        // output json format.
+        // 输出 json 格式。
         std::cout << "[";
         for (int i = 0; i < nDevices; i++) {
             cudaSetDevice(i);
@@ -191,7 +208,7 @@ def get_gpu_memory_usage():
         f.write(source)
         f.flush()
         try:
-            # TODO: add windows support
+            # TODO: 暂不支持 Windows
             cmd = (
                 f"g++ {f.name} -o {f_path.stem} -std=c++11"
                 f" -I{cuda_home / 'include'} -L{cuda_home / 'lib64'} -lcudart"

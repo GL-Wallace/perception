@@ -23,6 +23,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""模型 FLOPS 与参数量统计工具。
+
+改编自 flops-counter.pytorch，通过给模型各算子模块注册 forward hook 来累计
+乘加运算次数(FLOPs)与参数量。主要入口 get_model_complexity_info 返回模型的计算量
+与参数量（以 GMac/M 等单位格式化）。conv/deconv/linear/pool/relu/bn/upsample 等
+算子都注册了对应的 flops 计数 hook。上游版权见文件头 MIT License。
+"""
 import sys
 
 import numpy as np
@@ -64,6 +71,19 @@ def get_model_complexity_info(
     input_constructor=None,
     ost=sys.stdout,
 ):
+    """统计模型的 FLOPS 与参数量。
+
+    Args:
+        model: 待统计的网络。
+        input_res (tuple): 输入张量空间维度（不含 batch），如 (C, H, W)。
+        print_per_layer_stat (bool): 是否逐层打印统计。
+        as_strings (bool): 返回字符串（含单位）还是原始数值。
+        input_constructor: 可选，根据 input_res 构造输入的 callable。
+        ost: 输出流，默认 stdout。
+
+    Returns:
+        若 as_strings 为 True，返回 (flops_str, params_str)；否则返回 (flops, params)。
+    """
     assert type(input_res) is tuple
     assert len(input_res) >= 2
     flops_model = add_flops_counting_methods(model)

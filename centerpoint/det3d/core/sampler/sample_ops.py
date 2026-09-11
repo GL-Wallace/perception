@@ -1,3 +1,16 @@
+"""GT 数据库采样与「粘贴」到当前场景的实现。
+
+定义 DataBaseSamplerV2：从预处理后的 GT 数据库中按类别采样物体(可选按组
+采样)，把它们的位置/朝向摆放到当前场景中，读取并变换对应点云，配合碰撞
+检测避免与已有 GT 框重叠，从而实现对稀疏类别的数据增强。
+
+主要类：
+    - DataBaseSamplerV2: 数据库采样器，提供 sample_all/sample_class_v2/
+        sample_group 等接口。
+
+依赖 det3d.core.sampler.preprocess(增广与碰撞检测)与 det3d.core.bbox.box_np_ops
+(坐标/旋转操作)。
+"""
 import copy
 import pathlib
 import pickle
@@ -11,6 +24,20 @@ from det3d.utils.check import shape_mergeable
 
 
 class DataBaseSamplerV2:
+    """从 GT 数据库采样物体并拼接到场景的采样器。
+
+    初始化时按 groups 配置组织数据库(支持单类采样与按 group_id 的组采样)，
+    并在 sample_all 中按缺失数量完成各类别采样、读取点云、随机摆放与碰撞
+    剔除。
+
+    Attributes:
+        db_infos: 预处理后的数据库信息。
+        _rate: 采样比例(对缺失数量的折扣)。
+        _use_group_sampling: 是否启用按组采样。
+        _sampler_dict: 每个类别/组对应的 BatchSampler。
+        _enable_global_rot: 是否启用全局旋转摆放。
+    """
+
     def __init__(
         self,
         db_infos,
@@ -37,6 +64,7 @@ class DataBaseSamplerV2:
         self._sample_classes = []
         self._sample_max_nums = []
         self._use_group_sampling = False  # slower
+        # 若某个 group 包含多个类别，则启用按组采样
         if any([len(g) > 1 for g in groups]):
             self._use_group_sampling = True
         if not self._use_group_sampling:
@@ -54,6 +82,7 @@ class DataBaseSamplerV2:
                 self._sample_max_nums += list(group_info.values())
                 self._group_name_to_names.append((group_name, group_names))
                 # self._group_name_to_names[group_name] = group_names
+                # 按 group_id 归并同一组的物体
                 for name in group_names:
                     for item in db_infos[name]:
                         gid = item["group_id"]
@@ -92,6 +121,7 @@ class DataBaseSamplerV2:
 
     @property
     def use_group_sampling(self):
+        """是否启用按组采样。"""
         return self._use_group_sampling
 
     def sample_all(
@@ -105,11 +135,31 @@ class DataBaseSamplerV2:
         calib=None,
         road_planes=None,
     ):
+        """为每个类别采样所需数量的物体并返回拼接后的增广结果。
+
+        按各类别「目标数量 - 当前数量」计算采样数，逐类(或逐组)采样，读取
+        对应点云并做随机摆放/碰撞剔除，最后合并返回。
+
+        Args:
+            root_path: 数据库点云文件的根目录。
+            gt_boxes (np.ndarray): 当前场景已有 GT 框。
+            gt_names (list): 当前场景 GT 框对应的类别名。
+            num_point_features (int): 每点特征维数。
+            random_crop (bool): 是否对采样点做随机裁剪(需 calib)。
+            gt_group_ids (np.ndarray): 当前 GT 框的组 id(组采样必填)。
+            calib (dict): 相机标定(随机裁剪时使用)。
+            road_planes: 未使用。
+
+        Returns:
+            dict 或 None: 包含 gt_names/difficulty/gt_boxes/points/gt_masks/
+                group_ids；无采样时为 None。
+        """
         sampled_num_dict = {}
         sample_num_per_class = []
         for class_name, max_sample_num in zip(
             self._sample_classes, self._sample_max_nums
         ):
+            # 目标数量减去已有数量，得到需要采样的数量
             sampled_num = int(
                 max_sample_num - np.sum([n == class_name for n in gt_names])
             )
@@ -123,6 +173,7 @@ class DataBaseSamplerV2:
             assert gt_group_ids is not None
             sampled_groups = []
             sample_num_per_class = []
+            # 组内各类别目标数量取最大值作为该组采样数
             for group_name, class_names in self._group_name_to_names:
                 sampled_nums_group = [sampled_num_dict[n] for n in class_names]
                 sampled_num = np.max(sampled_nums_group)
@@ -154,6 +205,7 @@ class DataBaseSamplerV2:
                         )
 
                     sampled_gt_boxes += [sampled_gt_box]
+                    # 后续类别的碰撞检测需避开已粘贴的框
                     avoid_coll_boxes = np.concatenate(
                         [avoid_coll_boxes, sampled_gt_box], axis=0
                     )
@@ -182,10 +234,12 @@ class DataBaseSamplerV2:
                     ).reshape(-1, num_point_features)
 
                     if "rot_transform" in info:
+                        # 若曾做全局旋转，则记录的角度差需作用到点云
                         rot = info["rot_transform"]
                         s_points[:, :3] = box_np_ops.rotation_points_single_angle(
                             s_points[:, :4], rot, axis=2
                         )
+                    # 把物体点云平移到采样到的框中心
                     s_points[:, :3] += info["box3d_lidar"][:3]
                     s_points_list.append(s_points)
                     # print(pathlib.Path(info["path"]).stem)
@@ -193,6 +247,7 @@ class DataBaseSamplerV2:
                     print(str(pathlib.Path(root_path) / info["path"]))
                     continue
             if random_crop:
+                # 随机裁剪：用图像 2D 框构造视锥，裁掉框外点
                 s_points_list_new = []
                 assert calib is not None
                 rect = calib["rect"]
@@ -220,6 +275,7 @@ class DataBaseSamplerV2:
             if self._use_group_sampling:
                 ret["group_ids"] = np.array([s["group_id"] for s in sampled])
             else:
+                # 非组采样时给新框分配递增的新 id
                 ret["group_ids"] = np.arange(
                     gt_boxes.shape[0], gt_boxes.shape[0] + len(sampled)
                 )
@@ -228,6 +284,15 @@ class DataBaseSamplerV2:
         return ret
 
     def sample(self, name, num):
+        """按名称从对应 BatchSampler 中抽样。
+
+        Args:
+            name (str): 类别名或组名。
+            num (int): 抽样数量。
+
+        Returns:
+            tuple: (抽样得到的元素列表, 每组/每项包含的元素个数)。
+        """
         if self._use_group_sampling:
             group_name = name
             ret = self._sampler_dict[group_name].sample(num)
@@ -238,6 +303,7 @@ class DataBaseSamplerV2:
             return ret, np.ones((len(ret),), dtype=np.int64)
 
     def sample_v1(self, name, num):
+        """按名称(或名称列表)抽样的旧版接口。"""
         if isinstance(name, (list, tuple)):
             group_name = ", ".join(name)
             ret = self._sampler_dict[group_name].sample(num)
@@ -248,6 +314,16 @@ class DataBaseSamplerV2:
             return ret, np.ones((len(ret),), dtype=np.int64)
 
     def sample_class_v2(self, name, num, gt_boxes):
+        """对单个类别采样，做随机摆放与碰撞检测，返回有效的采样结果。
+
+        Args:
+            name (str): 类别名。
+            num (int): 采样数量。
+            gt_boxes (np.ndarray): 已有 GT 框(用于碰撞检测)。
+
+        Returns:
+            list: 通过碰撞检测的采样样本信息(dict)列表。
+        """
         sampled = self._sampler_dict[name].sample(num)
         sampled = copy.deepcopy(sampled)
         num_gt = gt_boxes.shape[0]
@@ -265,6 +341,7 @@ class DataBaseSamplerV2:
         boxes = np.concatenate([gt_boxes, sp_boxes], axis=0).copy()
         if self._enable_global_rot:
             # place samples to any place in a circle.
+            # 通过全局旋转把采样框随机摆放到圆周上的位置
             prep.noise_per_object_v3_(
                 boxes, None, valid_mask, 0, 0, self._global_rot_range, num_try=100
             )
@@ -283,6 +360,7 @@ class DataBaseSamplerV2:
         valid_samples = []
         for i in range(num_gt, num_gt + num_sampled):
             if coll_mat[i].any():
+                # 与任何框碰撞则丢弃
                 coll_mat[i] = False
                 coll_mat[:, i] = False
             else:
@@ -296,9 +374,21 @@ class DataBaseSamplerV2:
         return valid_samples
 
     def sample_group(self, name, num, gt_boxes, gt_group_ids):
+        """按组采样：整组物体一起摆放、做碰撞检测。
+
+        Args:
+            name (str): 组名。
+            num (int): 采样组数。
+            gt_boxes (np.ndarray): 已有 GT 框。
+            gt_group_ids (np.ndarray): 已有组 id。
+
+        Returns:
+            list: 有效的采样样本列表。
+        """
         sampled, group_num = self.sample(name, num)
         sampled = copy.deepcopy(sampled)
         # rewrite sampled group id to avoid duplicated with gt group ids
+        # 给采样组重新分配 id，避免与已有组 id 冲突
         gid_map = {}
         max_gt_gid = np.max(gt_group_ids)
         sampled_gid = max_gt_gid + 1
@@ -349,6 +439,7 @@ class DataBaseSamplerV2:
         idx = num_gt
         for num in group_num:
             if coll_mat[idx : idx + num].any():
+                # 组内任一个框碰撞则整组丢弃
                 coll_mat[idx : idx + num] = False
                 coll_mat[:, idx : idx + num] = False
             else:

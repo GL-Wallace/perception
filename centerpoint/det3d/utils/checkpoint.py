@@ -1,4 +1,17 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+"""checkpoint 保存/加载与训练日志工具。
+
+提供 state_dict 的前缀对齐/按后缀匹配加载、Checkpointer/det3dCheckpointer
+检查点管理器，以及基于 SummaryWriter 的 Writer 日志记录器。
+
+主要函数/类：
+    - flat_nested_json_dict / metric_to_str: 指标展平与格式化。
+    - align_and_update_state_dicts: 按后缀匹配对齐模型与加载的权重。
+    - load_state_dict / finetune_load_state_dict: 权重加载。
+    - Checkpointer / det3dCheckpointer: 检查点保存与加载。
+    - Writer: tensorboard 与文本日志记录。
+"""
+
 import json
 import logging
 import os
@@ -10,6 +23,7 @@ from tensorboardX import SummaryWriter
 
 
 def _flat_nested_json_dict(json_dict, flatted, sep=".", start=""):
+    """递归展平嵌套 dict（内部使用）。"""
     for k, v in json_dict.items():
         if isinstance(v, dict):
             _flat_nested_json_dict(v, flatted, sep, start + sep + str(k))
@@ -18,8 +32,7 @@ def _flat_nested_json_dict(json_dict, flatted, sep=".", start=""):
 
 
 def flat_nested_json_dict(json_dict, sep=".") -> dict:
-    """flat a nested json-like dict. this function make shadow copy.
-    """
+    """把嵌套 json 风格 dict 展平为单层 dict（浅拷贝）。"""
     flatted = {}
     for k, v in json_dict.items():
         if isinstance(v, dict):
@@ -30,6 +43,10 @@ def flat_nested_json_dict(json_dict, sep=".") -> dict:
 
 
 def metric_to_str(metrics, sep="."):
+    """把指标 dict 格式化为逗号分隔的字符串。
+
+    浮点数保留 4 位有效数字；浮点列表/元组以 [...] 形式输出。
+    """
     flatted_metrics = flat_nested_json_dict(metrics, sep)
     metrics_str_list = []
     for k, v in flatted_metrics.items():
@@ -47,24 +64,15 @@ def metric_to_str(metrics, sep="."):
 
 
 def align_and_update_state_dicts(model_state_dict, loaded_state_dict, logger=None):
-    """
-    Strategy: suppose that the models that we will create will have prefixes appended
-    to each of its keys, for example due to an extra level of nesting that the original
-    pre-trained weights from ImageNet won't contain. For example, model.state_dict()
-    might return backbone[0].body.res2.conv1.weight, while the pre-trained model contains
-    res2.conv1.weight. We thus want to match both parameters together.
-    For that, we look for each model weight, look among all loaded keys if there is one
-    that is a suffix of the current weight name, and use it if that's the case.
-    If multiple matches exist, take the one with longest size
-    of the corresponding name. For example, for the same model as before, the pretrained
-    weight file can contain both res2.conv1.weight, as well as conv1.weight. In this case,
-    we want to match backbone[0].body.conv1.weight to conv1.weight, and
-    backbone[0].body.res2.conv1.weight to res2.conv1.weight.
+    """把加载的权重按键名后缀对齐到模型权重。
+
+    策略：模型键名可能带有额外前缀（如 backbone[0].body.res2.conv1.weight），
+    而预训练权重只含 res2.conv1.weight。对每个模型权重，在所有加载键中寻找其
+    后缀匹配项；若有多个匹配，取对应名称最长者。匹配不到的键保持原值不变。
     """
     current_keys = sorted(list(model_state_dict.keys()))
     loaded_keys = sorted(list(loaded_state_dict.keys()))
-    # get a matrix of string matches, where each (i, j) entry correspond to the size of the
-    # loaded_key string, if it matches
+    # 构造匹配矩阵：entry (i, j) 为能匹配的 loaded_key 字符串长度。
     match_matrix = [
         len(j) if i.endswith(j) else 0 for i in current_keys for j in loaded_keys
     ]
@@ -72,10 +80,10 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, logger=Non
         len(current_keys), len(loaded_keys)
     )
     max_match_size, idxs = match_matrix.max(1)
-    # remove indices that correspond to no-match
+    # 无匹配的条目索引置 -1。
     idxs[max_match_size == 0] = -1
 
-    # used for logging
+    # 仅用于日志对齐。
     max_size = max([len(key) for key in current_keys]) if current_keys else 1
     max_size_loaded = max([len(key) for key in loaded_keys]) if loaded_keys else 1
     log_str_template = "{: <{}} loaded from {: <{}} of shape {}"
@@ -99,6 +107,7 @@ def align_and_update_state_dicts(model_state_dict, loaded_state_dict, logger=Non
 
 
 def strip_prefix_if_present(state_dict, prefix):
+    """若所有键都以给定前缀开头，则去除该前缀后返回新的 OrderedDict。"""
     keys = sorted(state_dict.keys())
     if not all(key.startswith(prefix) for key in keys):
         return state_dict
@@ -109,33 +118,39 @@ def strip_prefix_if_present(state_dict, prefix):
 
 
 def load_state_dict(model, loaded_state_dict, logger=None):
+    """加载权重到模型（严格匹配）。
+
+    若权重来自被 DataParallel/DistributedDataParallel 包裹的模型，先去除
+    "module." 前缀，再按后缀对齐加载。
+    """
     model_state_dict = model.state_dict()
-    # if the state_dict comes from a model that was wrapped in a
-    # DataParallel or DistributedDataParallel during serialization,
-    # remove the "module" prefix before performing the matching
+    # 权重若来自 DataParallel / DistributedDataParallel 序列化，
+    # 先去 "module." 前缀再做匹配。
     loaded_state_dict = strip_prefix_if_present(loaded_state_dict, prefix="module.")
     align_and_update_state_dicts(model_state_dict, loaded_state_dict, logger=logger)
 
-    # use strict loading
+    # 严格加载
     model.load_state_dict(model_state_dict)
 
 
 def finetune_load_state_dict(model, loaded_state_dict, logger=None):
+    """微调加载权重：在严格加载前过滤掉以 rpn.tasks 开头的键。"""
     model_state_dict = model.state_dict()
-    # if the state_dict comes from a model that was wrapped in a
-    # DataParallel or DistributedDataParallel during serialization,
-    # remove the "module" prefix before performing the matching
+    # 权重若来自 DataParallel / DistributedDataParallel 序列化，
+    # 先去 "module." 前缀再做匹配。
     loaded_state_dict = strip_prefix_if_present(loaded_state_dict, prefix="module.")
     loaded_state_dict = {
         k: v for k, v in loaded_state_dict.items() if not k.startswith("rpn.tasks")
     }
     align_and_update_state_dicts(model_state_dict, loaded_state_dict, logger=logger)
 
-    # use strict loading
+    # 严格加载
     model.load_state_dict(model_state_dict)
 
 
 class Checkpointer(object):
+    """检查点管理器：负责模型的保存、加载与 last_checkpoint 标记。"""
+
     def __init__(
         self,
         model,
@@ -149,7 +164,7 @@ class Checkpointer(object):
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.pretrained_path = ckpt_path  # whether pretrained
+        self.pretrained_path = ckpt_path  # 是否为预训练权重
         self.finetune = False
         self.save_dir = save_dir
         self.save_to_disk = save_to_disk
@@ -158,6 +173,7 @@ class Checkpointer(object):
         self.logger = logger
 
     def save(self, name, **kwargs):
+        """保存模型（及可选的优化器/调度器）状态到 save_dir。"""
         self.logger.info(name)
         if not self.save_dir:
             return
@@ -180,14 +196,15 @@ class Checkpointer(object):
         self.tag_last_checkpoint(save_file)
 
     def load(self, f=None):
+        """加载检查点：恢复模型，并恢复存在的优化器与调度器状态。"""
         if f is not None:
             f = self.get_checkpoint_file(f)
         elif self.has_checkpoint(self.save_dir):
-            # override argument with existing checkpoint
+            # 用已有检查点覆盖参数。
             f = self.get_checkpoint_file(self.save_dir)
 
         if not f:
-            # no checkpoint could be found
+            # 未找到检查点，从头初始化。
             self.logger.info("No checkpoint found. Initializing model from scratch")
             return {}
         self.logger.info("Loading checkpoint from {}".format(f))
@@ -200,10 +217,11 @@ class Checkpointer(object):
             self.logger.info("Loading scheduler from {}".format(f))
             self.scheduler.load_state_dict(checkpoint.pop("scheduler"))
 
-        # return any further checkpoint data
+        # 返回剩余检查点数据。
         return checkpoint
 
     def finetune_load(self, ckpt_path=None, f=None):
+        """加载预训练权重用于微调。"""
         if ckpt_path is not None:
             self.pretrained_path = ckpt_path
             self.finetune = True
@@ -214,22 +232,24 @@ class Checkpointer(object):
         self._load_model(checkpoint)
 
     def has_checkpoint(self, save_dir):
+        """判断 save_dir 下是否存在 last_checkpoint 标记文件。"""
         save_file = os.path.join(save_dir, "last_checkpoint")
         return os.path.exists(save_file)
 
     def get_checkpoint_file(self, save_dir):
+        """读取 last_checkpoint 中记录的最新检查点文件名。"""
         save_file = os.path.join(save_dir, "last_checkpoint")
         try:
             with open(save_file, "r") as f:
                 last_saved = f.read()
                 last_saved = last_saved.strip()
         except IOError:
-            # if file doesn't exist, maybe because it has just been
-            # deleted by a separate process
+            # 文件不存在（可能被其他进程删除）。
             last_saved = ""
         return last_saved
 
     def tag_last_checkpoint(self, last_filename):
+        """把最新检查点文件名写入 last_checkpoint。"""
         save_file = os.path.join(self.save_dir, "last_checkpoint")
         with open(save_file, "w") as f:
             f.write(last_filename)
@@ -247,6 +267,8 @@ class Checkpointer(object):
 
 
 class det3dCheckpointer(Checkpointer):
+    """CenterPoint 专用检查点管理器：兼容无 "model" 键的旧检查点格式。"""
+
     def __init__(
         self,
         # cfg,
@@ -265,7 +287,7 @@ class det3dCheckpointer(Checkpointer):
         self.logger = logger
 
     def _load_file(self, f):
-        # load native detectron.pytorch checkpoint
+        # 加载原生 detectron.pytorch 检查点。
         loaded = super(det3dCheckpointer, self)._load_file(f)
         if "model" not in loaded:
             loaded = dict(model=loaded)
@@ -273,6 +295,8 @@ class det3dCheckpointer(Checkpointer):
 
 
 class Writer:
+    """训练日志记录器：写入 tensorboard 标量/文本并导出标量 JSON。"""
+
     def __init__(self, save_dir):
         self.save_dir = Path(save_dir)
         self.log_mjson_file = None
@@ -282,6 +306,7 @@ class Writer:
         self._tb_texts = []
 
     def open(self):
+        """打开 SummaryWriter。"""
         save_dir = self.save_dir
         assert save_dir.exists()
         summary_dir = save_dir / "summary"
@@ -290,6 +315,7 @@ class Writer:
         return self
 
     def close(self):
+        """导出标量 JSON 并关闭 SummaryWriter。"""
         assert self.summary_writter is not None
         tb_json_path = str(self.save_dir / "tensorboard_scalars.json")
         self.summary_writter.export_scalars_to_json(tb_json_path)
@@ -297,9 +323,9 @@ class Writer:
         self.summary_writter = None
 
     def log_text(self, text, step, tag="regular log"):
-        """This function only add text to log.txt and tensorboard texts
-        """
+        """把文本加入 log.txt 与 tensorboard texts。"""
         if step > self._text_current_gstep and self._text_current_gstep != -1:
+            # 跨 step 时，将累积文本批量写入 tensorboard 并清空缓存。
             total_text = "\n".join(self._tb_texts)
             self.summary_writter.add_text(tag, total_text, global_step=step)
             self._tb_texts = []
@@ -311,6 +337,7 @@ class Writer:
             self._text_current_gstep = step
 
     def log_metrics(self, metrics: dict, step):
+        """把扁平化后的指标以标量写入 tensorboard。"""
         flatted_summarys = flat_nested_json_dict(metrics, "/")
         for k, v in flatted_summarys.items():
             if isinstance(v, (list, tuple)):

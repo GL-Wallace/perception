@@ -1,3 +1,9 @@
+"""通用工具子包。
+
+汇总并对外导出配置加载、类型判断与转换、路径操作、进度条与计时器等通用工具，
+供 torchie 其他子模块（fileio、trainer 等）以及上层训练代码复用。
+"""
+
 from .config import Config, ConfigDict
 from .misc import (
     check_prerequisites,

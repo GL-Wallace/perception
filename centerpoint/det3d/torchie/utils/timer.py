@@ -1,14 +1,30 @@
+"""计时工具。
+
+提供轻量的 Timer 类与全局 check_time 计时点，用于测量训练循环、数据加载等
+关键路径的耗时，辅助性能分析（如进度条计算 elapsed/ETA 时会复用 Timer）。
+
+主要类/函数：
+    - TimerError: 计时器相关异常。
+    - Timer: 支持上下文管理器与分段计时的计时器。
+    - check_time: 基于全局注册表的单行计时点。
+"""
+
 from time import time
 
 
 class TimerError(Exception):
+    """计时器在未运行时被查询等非法操作时抛出的异常。"""
+
     def __init__(self, message):
         self.message = message
         super(TimerError, self).__init__(message)
 
 
 class Timer(object):
-    """A flexible Timer class.
+    """一个灵活的计时器。
+
+    支持 ``with`` 上下文管理器，以及自计时开始/自上次检查以来两种计时口径：
+    可以在任意位置调用 since_start / since_last_check 记录分段耗时。
 
     :Example:
 
@@ -41,7 +57,7 @@ class Timer(object):
 
     @property
     def is_running(self):
-        """bool: indicate whether the timer is running"""
+        """bool: 计时器是否正在运行"""
         return self._is_running
 
     def __enter__(self):
@@ -49,20 +65,22 @@ class Timer(object):
         return self
 
     def __exit__(self, type, value, traceback):
+        # 退出上下文时按模板打印本段耗时。
         print(self.print_tmpl.format(self.since_last_check()))
         self._is_running = False
 
     def start(self):
-        """Start the timer."""
+        """启动计时器。"""
         if not self._is_running:
             self._t_start = time()
             self._is_running = True
+        # 每次 start 都刷新「上次检查」时间点。
         self._t_last = time()
 
     def since_start(self):
-        """Total time since the timer is started.
+        """自计时器启动以来的总时长。
 
-        Returns (float): Time in seconds.
+        Returns (float): 以秒为单位的时间。
         """
         if not self._is_running:
             raise TimerError("timer is not running")
@@ -70,12 +88,12 @@ class Timer(object):
         return self._t_last - self._t_start
 
     def since_last_check(self):
-        """Time since the last checking.
+        """自上一次检查以来的时长。
 
-        Either :func:`since_start` or :func:`since_last_check` is a checking
-        operation.
+        :func:`since_start` 与 :func:`since_last_check` 都属于检查操作，
+        都会刷新「上次检查」时间点。
 
-        Returns (float): Time in seconds.
+        Returns (float): 以秒为单位的时间。
         """
         if not self._is_running:
             raise TimerError("timer is not running")
@@ -88,10 +106,10 @@ _g_timers = {}  # global timers
 
 
 def check_time(timer_id):
-    """Add check points in a single line.
+    """以单行方式添加计时检查点。
 
-    This method is suitable for running a task on a list of items. A timer will
-    be registered when the method is called for the first time.
+    适合对一批任务逐项计时：第一次调用时会为该 id 注册一个 Timer 并返回 0，
+    此后每次调用返回自上次检查以来经过的秒数。
 
     :Example:
 
@@ -107,7 +125,7 @@ def check_time(timer_id):
     5.000
 
     Args:
-        timer_id (str): Timer identifier.
+        timer_id (str): 计时器标识。
     """
     if timer_id not in _g_timers:
         _g_timers[timer_id] = Timer()
