@@ -131,13 +131,18 @@ def extract_points_from_range_image(laser, calibration, frame_pose):
   else:
     pixel_pose = None
     frame_pose = None
-  first_return = zlib.decompress(
-      laser.ri_return1.range_image_compressed)
-  second_return = zlib.decompress(
-      laser.ri_return2.range_image_compressed)
+
+  first_return = zlib.decompress(laser.ri_return1.range_image_compressed)
+  second_return = zlib.decompress(laser.ri_return2.range_image_compressed)
   points_list = []
   for range_image_str in [first_return, second_return]:
     range_image = dataset_pb2.MatrixFloat.FromString(range_image_str)
+
+    '''
+    beam_inclinations
+    TOP 雷达有 64 根独立的激光线束，垂直方向上下排布：有的线束朝上仰；有的线束朝下俯；
+    这个角度是雷达本体坐标系内预先标定好的静态参数,单位：弧度（rad）。
+    '''
     if not calibration.beam_inclinations:
       beam_inclinations = range_image_utils.compute_inclination(
           tf.constant([
@@ -146,7 +151,9 @@ def extract_points_from_range_image(laser, calibration, frame_pose):
           height=range_image.shape.dims[0])
     else:
       beam_inclinations = tf.constant(calibration.beam_inclinations)
+    # RangeImage 图像第一行，存储的是最下方线束；数组顺序反过来，才能匹配几何角度。如果不反转，角度上下颠倒，最后解出来的点云会上下翻转。
     beam_inclinations = tf.reverse(beam_inclinations, axis=[-1])
+
     extrinsic = np.reshape(np.array(calibration.extrinsic.transform), [4, 4])
     range_image_tensor = tf.reshape(
         tf.convert_to_tensor(range_image.data), range_image.shape.dims)
@@ -165,7 +172,7 @@ def extract_points_from_range_image(laser, calibration, frame_pose):
                   axis=-1),
         tf.where(range_image_mask))
     points_list.append(points_tensor.numpy())
-  return points_list
+  return points_list # (num, 6) [Xv,Yv,Zv, intensity, elongation, is_second_return]
 
 
 def extract_points(lasers, laser_calibrations, frame_pose):
@@ -259,7 +266,7 @@ def extract_objects(laser_labels, global_from_ref_rotation):
                          box.length, box.width, box.height, ref_velocity[0], 
                          ref_velocity[1], box.heading], dtype=np.float32),
         'num_points':
-            num_lidar_points_in_box,
+            num_lidar_points_in_box, # 落在这个 3D 标注框内部的激光雷达点的总个数
         'detection_difficulty_level':
             label.detection_difficulty_level,
         'combined_difficulty_level':

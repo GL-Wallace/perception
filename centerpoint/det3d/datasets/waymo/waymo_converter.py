@@ -78,10 +78,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Waymo Data Converter')
     parser.add_argument('--root_path', type=str, required=False)
     parser.add_argument('--record_path', type=str, required=False)
-    args.root_path = "data/Waymo"
-    args.record_path = "dataset/waymo/tfrecord_training/*.tfrecord"
 
     args = parser.parse_args()
+
+    # 如果命令行没传参，手动赋值
+    if args.root_path is None:
+        args.root_path = "/home/sti/GitHub/perception/centerpoint/data/Waymo"
+    if args.record_path is None:
+        args.record_path = "/home/sti/GitHub/perception/centerpoint/dataset/waymo/tfrecord_training/*.tfrecord"
 
 
     if not os.path.isdir(args.root_path):
